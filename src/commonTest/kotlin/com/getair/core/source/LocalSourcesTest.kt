@@ -61,4 +61,19 @@ class LocalSourcesTest {
         assertEquals(revision, registry.state.value.revision)
         assertIs<SourceRefreshResult.LocalOnly>(registry.refreshMetadata())
     }
+
+    @Test
+    fun reconstructedEquivalentCredentialDoesNotChurnRevision() = runTest {
+        val registry = LocalSourceRegistry(InMemoryLocalSourceStore(), InMemoryLocalSourceSecretStore())
+        val profile = LocalSourceProfile(LocalSourceId("living-tv"), "Living TV", LocalSourceKind.Xtream)
+        fun secret() = XtreamSourceSecret(
+            XtreamCredentials("https://provider.invalid", "user", "password", StreamFormat.M3u8),
+        )
+
+        registry.upsert(profile, secret())
+        val revision = registry.state.value.revision
+        registry.upsert(profile, secret())
+
+        assertEquals(revision, registry.state.value.revision)
+    }
 }

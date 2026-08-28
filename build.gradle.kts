@@ -16,7 +16,11 @@ kotlin {
     androidTarget { compilerOptions.jvmTarget.set(JvmTarget.JVM_17) }
     jvm { compilerOptions.jvmTarget.set(JvmTarget.JVM_17) }
     linuxX64()
-    mingwX64()
+    mingwX64 {
+        compilations.getByName("main") {
+            cinterops.create("wincred")
+        }
+    }
     macosX64()
     macosArm64()
     iosX64()

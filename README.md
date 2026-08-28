@@ -22,8 +22,13 @@ accepts a `HouseholdSyncSource` only when a future server exists.
 `LocalSourceRegistry` stores only non-secret source names/kinds/enabled state in
 ordinary local state. Exact `XtreamCredentials`/`StalkerCredentials`, M3U/XMLTV
 URLs and headers, and Stremio manifest URLs stay behind a required
-`LocalSourceSecretStore`. Only metadata has an optional future sync source;
-browser persistence and plaintext production vaults are not supplied.
+`LocalSourceSecretStore`. Production adapters use Android Keystore plus AES-GCM,
+Apple Keychain, Windows Credential Manager, or KDE Wallet without libsecret.
+Windows payloads use generation-addressed chunks so Credential Manager's small
+blob limit cannot truncate Stalker fields or request headers. Only metadata has
+an optional future sync source. Browser persistence and plaintext production
+vaults are deliberately not supplied because browser storage is not an OS
+credential vault.
 
 `LocalFirstContinueWatchingRepository` keeps resume progress per household
 profile using typed Stremio movie/series IDs or IPTV movie/episode IDs. Live TV

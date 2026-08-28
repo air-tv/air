@@ -13,7 +13,7 @@ import kotlin.jvm.JvmInline
 @Serializable
 @JvmInline
 value class LocalSourceId(val value: String) {
-    init { require(value.isNotBlank()) }
+    init { require(value.isNotBlank() && value.length <= 128 && '\u0000' !in value) }
 }
 
 @Serializable
@@ -50,8 +50,10 @@ class StalkerSourceSecret(
 class M3uSourceSecret(
     val playlistUrl: String,
     val xmltvUrl: String? = null,
-    val headers: Map<String, String> = emptyMap(),
+    headers: Map<String, String> = emptyMap(),
 ) : LocalSourceSecret {
+    val headers: Map<String, String> = headers.toMap()
+
     init {
         require(playlistUrl.isNotBlank())
         require(xmltvUrl == null || xmltvUrl.isNotBlank())
@@ -64,8 +66,10 @@ class M3uSourceSecret(
 
 class StremioAddonSourceSecret(
     val manifestUrl: String,
-    val headers: Map<String, String> = emptyMap(),
+    headers: Map<String, String> = emptyMap(),
 ) : LocalSourceSecret {
+    val headers: Map<String, String> = headers.toMap()
+
     init { require(manifestUrl.isNotBlank()) }
     override val kind: LocalSourceKind = LocalSourceKind.StremioAddon
     override fun toString(): String =
@@ -140,7 +144,7 @@ class LocalSourceRegistry(
         val replaced = previous.profiles.filter {
             it.id == profile.id || it.name.equals(profile.name, ignoreCase = true)
         }
-        if (replaced.size == 1 && replaced.single() == profile && secrets.read(profile.id) === secret) {
+        if (replaced.size == 1 && replaced.single() == profile && secrets.read(profile.id).contentEquals(secret)) {
             return@withLock
         }
         secrets.write(profile.id, secret)
@@ -192,4 +196,27 @@ class LocalSourceRegistry(
 
     override fun toString(): String =
         "LocalSourceRegistry(store=<redacted>, secrets=<redacted>, syncSource=${syncSource != null})"
+}
+
+private fun LocalSourceSecret?.contentEquals(other: LocalSourceSecret): Boolean = when {
+    this is XtreamSourceSecret && other is XtreamSourceSecret ->
+        credentials.baseUrl == other.credentials.baseUrl &&
+            credentials.username == other.credentials.username &&
+            credentials.password == other.credentials.password &&
+            credentials.preferredFormat == other.credentials.preferredFormat
+    this is StalkerSourceSecret && other is StalkerSourceSecret ->
+        credentials.portalUrl == other.credentials.portalUrl &&
+            credentials.macAddress == other.credentials.macAddress &&
+            credentials.timezone == other.credentials.timezone &&
+            credentials.language == other.credentials.language &&
+            credentials.userAgent == other.credentials.userAgent &&
+            credentials.serialNumber == other.credentials.serialNumber &&
+            credentials.deviceId == other.credentials.deviceId &&
+            credentials.deviceId2 == other.credentials.deviceId2 &&
+            credentials.signature == other.credentials.signature
+    this is M3uSourceSecret && other is M3uSourceSecret ->
+        playlistUrl == other.playlistUrl && xmltvUrl == other.xmltvUrl && headers == other.headers
+    this is StremioAddonSourceSecret && other is StremioAddonSourceSecret ->
+        manifestUrl == other.manifestUrl && headers == other.headers
+    else -> false
 }

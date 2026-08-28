@@ -1,0 +1,4 @@
+package = com.getair.core.wincred
+headers = windows.h wincred.h
+headerFilter = wincred.h
+linkerOpts = -ladvapi32
