@@ -962,7 +962,7 @@ internal class SqlDelightDurableGuideStore(
             }
             if (expiredLeases == 0 && retiredSourceFeeds == 0) {
                 expiredWriters = if (expireOneWriter(now)) 1 else 0
-                removed = cleanupOneGeneration(now, maxRows)
+                if (expiredWriters == 0) removed = cleanupOneGeneration(now, maxRows)
             }
             hasMore = cleanupEligible(now)
         }

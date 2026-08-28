@@ -328,8 +328,14 @@ private suspend fun verifyGenerationLifecycle(factory: DurableGuideStoreContract
     factory.advanceTimeBy(store, store.generationIdleTimeoutMillis + 1)
     val reopened = factory.reopen(store)
     cleanup = reopened.cleanupUnreachable(1)
-    assertEquals(1, cleanup.removedRows)
-    while (cleanup.hasMore) cleanup = reopened.cleanupUnreachable(1)
+    assertEquals(0, cleanup.removedRows)
+    assertTrue(cleanup.hasMore)
+    var crashedRemoved = 0
+    while (cleanup.hasMore) {
+        cleanup = reopened.cleanupUnreachable(1)
+        crashedRemoved += cleanup.removedRows
+    }
+    assertEquals(2, crashedRemoved)
     assertEquals("base", firstSearchTitle(reopened, key))
 
     val empty = reopened.beginRefresh(key, retention(1_000, 0, 10_000))
@@ -1300,6 +1306,16 @@ internal class ContractInMemoryDurableGuideStore private constructor(
         reapExpiredLeases()
         var remaining = maxRows
         var removed = 0
+        val expiredWriter = generations.firstOrNull { generation ->
+            latest[generation.key] === generation && !generation.abandoned &&
+                !generation.superseded && !generation.activated && !generation.limitExceeded &&
+                generation.expiresAt <= nowMillis
+        }
+        if (expiredWriter != null) {
+            expiredWriter.limitExceeded = true
+            latest.remove(expiredWriter.key)
+            remaining -= 1
+        }
         val generationIterator = generations.iterator()
         while (generationIterator.hasNext() && remaining > 0) {
             val generation = generationIterator.next()

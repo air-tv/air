@@ -197,6 +197,48 @@ class SqlDelightDurableGuideStoreTest {
     }
 
     @Test
+    fun expiredWriterConsumesTheOnlyCleanupUnitBeforePayloadDeletion() = runTest {
+        val directory = createTempDirectory("air-guide-expired-writer-")
+        val path = directory.resolve("catalog.db")
+        var now = 55_000L
+        try {
+            val store = openStore(path) { now }
+            val key = guideKey("expired-writer", "main")
+            val channel = channelKey("expired-writer")
+            val generation = store.guides.beginRefresh(
+                key,
+                DurableGuideRetention(instant(1_000), instant(0), instant(10_000)),
+            )
+            store.guides.stage(
+                generation,
+                channels = listOf(DurableGuideChannelRecord(channel, listOf("Channel"))),
+                programmes = listOf(
+                    DurableGuideProgrammeRecord(channel, instant(1_000), instant(2_000), "Programme"),
+                ),
+            )
+            now += store.guides.generationIdleTimeoutMillis + 1
+
+            val first = store.guides.cleanupUnreachable(1)
+            val firstWork = (store.guides as SqlDelightDurableGuideStore).lastCleanupWorkForTest
+            assertEquals(0, first.removedRows)
+            assertEquals(1, firstWork.expiredWriters)
+            assertEquals(0, firstWork.removedPayloadRows)
+            assertEquals(1, firstWork.total)
+            assertTrue(first.hasMore)
+
+            val second = store.guides.cleanupUnreachable(1)
+            val secondWork = store.guides.lastCleanupWorkForTest
+            assertEquals(1, second.removedRows)
+            assertEquals(0, secondWork.expiredWriters)
+            assertEquals(1, secondWork.removedPayloadRows)
+            assertEquals(1, secondWork.total)
+            store.close()
+        } finally {
+            directory.toFile().deleteRecursively()
+        }
+    }
+
+    @Test
     fun leaseAdmissionCapIsGlobalAcrossBackendOwners() = runTest {
         val directory = createTempDirectory("air-guide-global-leases-")
         val path = directory.resolve("catalog.db")
