@@ -33,5 +33,6 @@ jobs:
           compileKotlinJvm
           compileKotlinJs
           compileKotlinWasmJs
+          -PuseLocalAirBuilds=false
           --max-workers=2
           --no-daemon
