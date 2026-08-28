@@ -271,6 +271,33 @@ internal suspend fun verifyIndexedDbGuideReviewRegressions(
         assertFalse(emptyWindow.truncated)
         store.release(windowLease)
 
+        val edgeRetention = DurableGuideRetention(
+            Instant.fromEpochMilliseconds(1_000),
+            Instant.fromEpochMilliseconds(1_000),
+            Instant.fromEpochMilliseconds(10_000),
+        )
+        val edgeKey = DurableGuideKey(source, DurableGuideFeedId("left-edge-regression"))
+        val edgeGeneration = store.beginRefresh(edgeKey, edgeRetention)
+        store.stage(
+            edgeGeneration,
+            listOf(DurableGuideChannelRecord(channelA, listOf("Left edge"))),
+            listOf(programme(channelA, 500, "overlaps-left-edge", durationMillis = 1_000)),
+        )
+        val edgeSnapshot = (store.activate(edgeGeneration, DurableGuideCounts(1, 1)) as
+            DurableGuideActivation.Published).snapshot
+        val edgeLease = assertNotNull(store.acquire(edgeSnapshot))
+        assertEquals(
+            "overlaps-left-edge",
+            store.window(
+                edgeLease,
+                channelA,
+                Instant.fromEpochMilliseconds(1_000),
+                Instant.fromEpochMilliseconds(1_100),
+                limit = 10,
+            ).programmes.single().title,
+        )
+        store.release(edgeLease)
+
         // maxRows=1 consumes at most one expired lease or payload row per pass.
         val cleanupKey = DurableGuideKey(source, DurableGuideFeedId("cleanup-regression"))
         val cleanupGeneration = store.beginRefresh(cleanupKey, retention)

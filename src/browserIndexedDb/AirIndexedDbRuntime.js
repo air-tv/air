@@ -58,7 +58,7 @@
         let openRequest;
         let blocked = false;
         try {
-          openRequest = root.indexedDB.open(name, 3);
+          openRequest = root.indexedDB.open(name, 4);
         } catch (failure) {
           reject(error(classify(failure)));
           return;
@@ -102,16 +102,6 @@
                 ["generationKey", "channelKey", "effectiveEndMs", "startMs"],
                 { unique: true },
               );
-              programmes.createIndex(
-                "generationChannelFiniteStart",
-                ["generationKey", "channelKey", "finiteStartMs"],
-                { unique: true },
-              );
-              programmes.createIndex(
-                "generationChannelOpenStart",
-                ["generationKey", "channelKey", "openStartMs"],
-                { unique: true },
-              );
               programmes.createIndex("generationLocator", ["generationKey", "key"], { unique: true });
             }
             if (!database.objectStoreNames.contains(STORE.guideLeases)) {
@@ -123,6 +113,65 @@
               database.createObjectStore(STORE.guideCleanupQueue, { keyPath: "key" })
                 .createIndex("cleanupAt", "cleanupAt", { unique: false });
             }
+          }
+          if (event.oldVersion < 4) {
+            const upgrade = openRequest.transaction;
+            const generations = upgrade.objectStore(STORE.guideGenerations);
+            const programmes = upgrade.objectStore(STORE.guideProgrammes);
+            if (!programmes.indexNames.contains("generationChannelFiniteStart")) {
+              programmes.createIndex(
+                "generationChannelFiniteStart",
+                ["generationKey", "channelKey", "finiteStartMs"],
+                { unique: true },
+              );
+            }
+            if (!programmes.indexNames.contains("generationChannelOpenStart")) {
+              programmes.createIndex(
+                "generationChannelOpenStart",
+                ["generationKey", "channelKey", "openStartMs"],
+                { unique: true },
+              );
+            }
+            const generationCursorRequest = generations.openCursor();
+            generationCursorRequest.onsuccess = () => {
+              const generationCursor = generationCursorRequest.result;
+              if (generationCursor) {
+                const generation = generationCursor.value;
+                generation.maxFiniteSpanMs = 0;
+                generation.minStartMs = null;
+                generationCursor.update(generation);
+                generationCursor.continue();
+                return;
+              }
+              const programmeCursorRequest = programmes.openCursor();
+              programmeCursorRequest.onsuccess = () => {
+                const programmeCursor = programmeCursorRequest.result;
+                if (!programmeCursor) return;
+                const programme = programmeCursor.value;
+                delete programme.finiteStartMs;
+                delete programme.openStartMs;
+                if (programme.endMs === null) programme.openStartMs = programme.startMs;
+                else programme.finiteStartMs = programme.startMs;
+                programmeCursor.update(programme);
+                const generationRequest = generations.get(programme.generationKey);
+                generationRequest.onsuccess = () => {
+                  const generation = generationRequest.result;
+                  if (generation) {
+                    generation.minStartMs = generation.minStartMs === null
+                      ? programme.startMs
+                      : Math.min(generation.minStartMs, programme.startMs);
+                    if (programme.endMs !== null) {
+                      generation.maxFiniteSpanMs = Math.max(
+                        generation.maxFiniteSpanMs,
+                        programme.effectiveEndMs - programme.startMs,
+                      );
+                    }
+                    generations.put(generation);
+                  }
+                  programmeCursor.continue();
+                };
+              };
+            };
           }
         };
         openRequest.onblocked = () => {
@@ -690,6 +739,7 @@
                   finiteStartPrefix: command.finiteStartBase + component + "|",
                   openStartPrefix: command.openStartBase + component + "|",
                   maxFiniteSpanMs: 0,
+                  minStartMs: null,
                   status: "staging",
                   expiresAt: command.nowMs + command.generationIdleTimeoutMillis,
                   batchCount: 0,
@@ -913,6 +963,9 @@
                   candidate.feedId = generation.feedId;
                   candidate.generation = generation.generation;
                   candidate.generationKey = generation.key;
+                  generation.minStartMs = generation.minStartMs === null
+                    ? candidate.startMs
+                    : Math.min(generation.minStartMs, candidate.startMs);
                   if (candidate.endMs === null) candidate.openStartMs = candidate.startMs;
                   else {
                     candidate.finiteStartMs = candidate.startMs;
@@ -1176,19 +1229,23 @@
         case "durableGuideWindow":
           return transaction(database, [STORE.guideLeases, STORE.guideGenerations, STORE.guideProgrammes], "readonly", command.operationId, (tx, setResult, fail) => {
             guideLease(tx, command, (_lease, generation) => {
+              if (generation.minStartMs === null) {
+                setResult({ status: "ok", rows: [], nextStartMs: null, truncated: false, payloadBytes: 0 });
+                return;
+              }
               const store = tx.objectStore(STORE.guideProgrammes);
               const finiteIndex = store.index("generationChannelFiniteStart");
               const openIndex = store.index("generationChannelOpenStart");
               const finiteFloor = Math.max(
-                generation.retention.retainedFromMs,
+                Number.MIN_SAFE_INTEGER,
                 command.fromMs - generation.maxFiniteSpanMs,
               );
               const finiteLower = command.afterStartMs === null
                 ? finiteFloor
                 : Math.max(finiteFloor, command.afterStartMs);
               const openLower = command.afterStartMs === null
-                ? generation.retention.retainedFromMs
-                : Math.max(generation.retention.retainedFromMs, command.afterStartMs);
+                ? generation.minStartMs
+                : Math.max(generation.minStartMs, command.afterStartMs);
               const finiteRange = IDBKeyRange.bound(
                 [generation.key, command.channelKey, finiteLower],
                 [generation.key, command.channelKey, command.untilMs],
@@ -1198,7 +1255,7 @@
               const openRange = IDBKeyRange.bound(
                 [generation.key, command.channelKey, openLower],
                 [generation.key, command.channelKey, command.untilMs],
-                command.afterStartMs !== null && command.afterStartMs >= generation.retention.retainedFromMs,
+                command.afterStartMs !== null && command.afterStartMs >= generation.minStartMs,
                 true,
               );
               const rows = [];
@@ -1337,6 +1394,7 @@
                     finiteStartPrefix: command.finiteStartBase + component + "|",
                     openStartPrefix: command.openStartBase + component + "|",
                     maxFiniteSpanMs: 0,
+                    minStartMs: null,
                     status: "staging",
                     purpose: "prune",
                     expiresAt: command.nowMs + command.generationIdleTimeoutMillis,

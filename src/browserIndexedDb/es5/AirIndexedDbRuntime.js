@@ -62,7 +62,7 @@
                 var openRequest;
                 var blocked = false;
                 try {
-                    openRequest = root.indexedDB.open(name, 3);
+                    openRequest = root.indexedDB.open(name, 4);
                 }
                 catch (failure) {
                     reject(error_1(classify_1(failure)));
@@ -104,8 +104,6 @@
                             programmes.createIndex("endKey", "endKey", { unique: true });
                             programmes.createIndex("generationChannelStart", ["generationKey", "channelKey", "startMs"], { unique: true });
                             programmes.createIndex("generationChannelEffectiveEnd", ["generationKey", "channelKey", "effectiveEndMs", "startMs"], { unique: true });
-                            programmes.createIndex("generationChannelFiniteStart", ["generationKey", "channelKey", "finiteStartMs"], { unique: true });
-                            programmes.createIndex("generationChannelOpenStart", ["generationKey", "channelKey", "openStartMs"], { unique: true });
                             programmes.createIndex("generationLocator", ["generationKey", "key"], { unique: true });
                         }
                         if (!database.objectStoreNames.contains(STORE_1.guideLeases)) {
@@ -117,6 +115,57 @@
                             database.createObjectStore(STORE_1.guideCleanupQueue, { keyPath: "key" })
                                 .createIndex("cleanupAt", "cleanupAt", { unique: false });
                         }
+                    }
+                    if (event.oldVersion < 4) {
+                        var upgrade = openRequest.transaction;
+                        var generations_1 = upgrade.objectStore(STORE_1.guideGenerations);
+                        var programmes_1 = upgrade.objectStore(STORE_1.guideProgrammes);
+                        if (!programmes_1.indexNames.contains("generationChannelFiniteStart")) {
+                            programmes_1.createIndex("generationChannelFiniteStart", ["generationKey", "channelKey", "finiteStartMs"], { unique: true });
+                        }
+                        if (!programmes_1.indexNames.contains("generationChannelOpenStart")) {
+                            programmes_1.createIndex("generationChannelOpenStart", ["generationKey", "channelKey", "openStartMs"], { unique: true });
+                        }
+                        var generationCursorRequest_1 = generations_1.openCursor();
+                        generationCursorRequest_1.onsuccess = function () {
+                            var generationCursor = generationCursorRequest_1.result;
+                            if (generationCursor) {
+                                var generation = generationCursor.value;
+                                generation.maxFiniteSpanMs = 0;
+                                generation.minStartMs = null;
+                                generationCursor.update(generation);
+                                generationCursor.continue();
+                                return;
+                            }
+                            var programmeCursorRequest = programmes_1.openCursor();
+                            programmeCursorRequest.onsuccess = function () {
+                                var programmeCursor = programmeCursorRequest.result;
+                                if (!programmeCursor)
+                                    return;
+                                var programme = programmeCursor.value;
+                                delete programme.finiteStartMs;
+                                delete programme.openStartMs;
+                                if (programme.endMs === null)
+                                    programme.openStartMs = programme.startMs;
+                                else
+                                    programme.finiteStartMs = programme.startMs;
+                                programmeCursor.update(programme);
+                                var generationRequest = generations_1.get(programme.generationKey);
+                                generationRequest.onsuccess = function () {
+                                    var generation = generationRequest.result;
+                                    if (generation) {
+                                        generation.minStartMs = generation.minStartMs === null
+                                            ? programme.startMs
+                                            : Math.min(generation.minStartMs, programme.startMs);
+                                        if (programme.endMs !== null) {
+                                            generation.maxFiniteSpanMs = Math.max(generation.maxFiniteSpanMs, programme.effectiveEndMs - programme.startMs);
+                                        }
+                                        generations_1.put(generation);
+                                    }
+                                    programmeCursor.continue();
+                                };
+                            };
+                        };
                     }
                 };
                 openRequest.onblocked = function () {
@@ -794,6 +843,7 @@
                                         finiteStartPrefix: command.finiteStartBase + component + "|",
                                         openStartPrefix: command.openStartBase + component + "|",
                                         maxFiniteSpanMs: 0,
+                                        minStartMs: null,
                                         status: "staging",
                                         expiresAt: command.nowMs + command.generationIdleTimeoutMillis,
                                         batchCount: 0,
@@ -1039,6 +1089,9 @@
                                             candidate.feedId = generation.feedId;
                                             candidate.generation = generation.generation;
                                             candidate.generationKey = generation.key;
+                                            generation.minStartMs = generation.minStartMs === null
+                                                ? candidate.startMs
+                                                : Math.min(generation.minStartMs, candidate.startMs);
                                             if (candidate.endMs === null)
                                                 candidate.openStartMs = candidate.startMs;
                                             else {
@@ -1320,18 +1373,22 @@
                     case "durableGuideWindow":
                         return transaction_1(database, [STORE_1.guideLeases, STORE_1.guideGenerations, STORE_1.guideProgrammes], "readonly", command.operationId, function (tx, setResult, fail) {
                             guideLease_1(tx, command, function (_lease, generation) {
+                                if (generation.minStartMs === null) {
+                                    setResult({ status: "ok", rows: [], nextStartMs: null, truncated: false, payloadBytes: 0 });
+                                    return;
+                                }
                                 var store = tx.objectStore(STORE_1.guideProgrammes);
                                 var finiteIndex = store.index("generationChannelFiniteStart");
                                 var openIndex = store.index("generationChannelOpenStart");
-                                var finiteFloor = Math.max(generation.retention.retainedFromMs, command.fromMs - generation.maxFiniteSpanMs);
+                                var finiteFloor = Math.max(Number.MIN_SAFE_INTEGER, command.fromMs - generation.maxFiniteSpanMs);
                                 var finiteLower = command.afterStartMs === null
                                     ? finiteFloor
                                     : Math.max(finiteFloor, command.afterStartMs);
                                 var openLower = command.afterStartMs === null
-                                    ? generation.retention.retainedFromMs
-                                    : Math.max(generation.retention.retainedFromMs, command.afterStartMs);
+                                    ? generation.minStartMs
+                                    : Math.max(generation.minStartMs, command.afterStartMs);
                                 var finiteRange = IDBKeyRange.bound([generation.key, command.channelKey, finiteLower], [generation.key, command.channelKey, command.untilMs], command.afterStartMs !== null && command.afterStartMs >= finiteFloor, true);
-                                var openRange = IDBKeyRange.bound([generation.key, command.channelKey, openLower], [generation.key, command.channelKey, command.untilMs], command.afterStartMs !== null && command.afterStartMs >= generation.retention.retainedFromMs, true);
+                                var openRange = IDBKeyRange.bound([generation.key, command.channelKey, openLower], [generation.key, command.channelKey, command.untilMs], command.afterStartMs !== null && command.afterStartMs >= generation.minStartMs, true);
                                 var rows = [];
                                 var payloadBytes = 0;
                                 var visits = 0;
@@ -1490,6 +1547,7 @@
                                             finiteStartPrefix: command.finiteStartBase + component + "|",
                                             openStartPrefix: command.openStartBase + component + "|",
                                             maxFiniteSpanMs: 0,
+                                            minStartMs: null,
                                             status: "staging",
                                             purpose: "prune",
                                             expiresAt: command.nowMs + command.generationIdleTimeoutMillis,

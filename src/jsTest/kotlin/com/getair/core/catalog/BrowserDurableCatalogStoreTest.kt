@@ -74,16 +74,33 @@ class BrowserDurableCatalogStoreTest {
     }
 
     @Test
-    fun versionThreeUpgradePreservesVersionTwoMediaStores() = runTest(timeout = 30.seconds) {
+    fun versionFourUpgradePreservesVersionTwoMediaStores() = runTest(timeout = 30.seconds) {
         if (!verifyIndexedDbIsAvailableOrFailsHonestly()) return@runTest
         val databaseName = uniqueDatabase("v2-upgrade")
         createLegacyV2Database(databaseName).await()
         openBrowserDurableCatalogStore(databaseName).close()
         val inspection = inspectUpgradedDatabase(databaseName).await()
-        assertContains(inspection, "\"version\":3")
+        assertContains(inspection, "\"version\":4")
         assertContains(inspection, "\"legacy\":true")
         listOf("guideStates", "guideGenerations", "guideChannels", "guideProgrammes", "guideLeases", "guideCleanupQueue")
             .forEach { store -> assertContains(inspection, "\"$store\"") }
+    }
+
+    @Test
+    fun versionFourBackfillsPriorVersionThreeGuideIndexesAndBounds() = runTest(timeout = 30.seconds) {
+        if (!verifyIndexedDbIsAvailableOrFailsHonestly()) return@runTest
+        val databaseName = uniqueDatabase("v3-guide-upgrade")
+        createLegacyV3GuideDatabase(databaseName).await()
+        openBrowserDurableCatalogStore(databaseName).close()
+        val inspection = inspectLegacyV3GuideUpgrade(databaseName).await()
+        assertContains(inspection, "\"version\":4")
+        assertContains(inspection, "\"legacy\":true")
+        assertContains(inspection, "\"maxFiniteSpanMs\":1000")
+        assertContains(inspection, "\"minStartMs\":500")
+        assertContains(inspection, "\"finiteStartMs\":500")
+        assertContains(inspection, "\"openStartMs\":800")
+        assertContains(inspection, "\"generationChannelFiniteStart\"")
+        assertContains(inspection, "\"generationChannelOpenStart\"")
     }
 
     @Test
@@ -91,7 +108,7 @@ class BrowserDurableCatalogStoreTest {
         if (!verifyIndexedDbIsAvailableOrFailsHonestly()) return@runTest
         val databaseName = uniqueDatabase("version-change")
         val catalog = openBrowserDurableCatalogStore(databaseName)
-        assertContains(upgradeDatabaseToVersionFour(databaseName).await(), "\"version\":4")
+        assertContains(upgradeDatabaseToVersionFour(databaseName).await(), "\"version\":5")
         catalog.close()
     }
 
@@ -154,9 +171,93 @@ private fun inspectUpgradedDatabase(databaseName: String): Promise<String> = js(
 """)
 
 @Suppress("UNUSED_PARAMETER")
+private fun createLegacyV3GuideDatabase(databaseName: String): Promise<String> = js("""
+    new Promise(function(resolve, reject) {
+      var request = indexedDB.open(databaseName, 3);
+      request.onerror = function() { reject(request.error); };
+      request.onupgradeneeded = function() {
+        var database = request.result;
+        database.createObjectStore('sources');
+        database.createObjectStore('generations');
+        database.createObjectStore('orphanQueue');
+        database.createObjectStore('catalogRecords', { keyPath: 'recordKey' }).createIndex('orderKey', 'orderKey', { unique: true });
+        database.createObjectStore('channelRecords', { keyPath: 'recordKey' }).createIndex('orderKey', 'orderKey', { unique: true });
+        database.createObjectStore('programmes');
+        database.createObjectStore('counters');
+        database.createObjectStore('guideStates', { keyPath: 'key' }).createIndex('activeFeedKey', 'activeFeedKey', { unique: true });
+        var generations = database.createObjectStore('guideGenerations', { keyPath: 'key' });
+        generations.createIndex('sourceEpochKey', 'sourceEpochKey', { unique: false });
+        generations.createIndex('sourceFeedGeneration', ['sourceKey', 'feedId', 'generation'], { unique: true });
+        database.createObjectStore('guideChannels', { keyPath: 'key' }).createIndex('generationChannel', ['generationKey', 'channelKey'], { unique: true });
+        var programmes = database.createObjectStore('guideProgrammes', { keyPath: 'key' });
+        programmes.createIndex('endKey', 'endKey', { unique: true });
+        programmes.createIndex('generationChannelStart', ['generationKey', 'channelKey', 'startMs'], { unique: true });
+        programmes.createIndex('generationChannelEffectiveEnd', ['generationKey', 'channelKey', 'effectiveEndMs', 'startMs'], { unique: true });
+        programmes.createIndex('generationLocator', ['generationKey', 'key'], { unique: true });
+        var leases = database.createObjectStore('guideLeases', { keyPath: 'key' });
+        leases.createIndex('generationKey', 'generationKey', { unique: false });
+        leases.createIndex('expiresAt', 'expiresAt', { unique: false });
+        database.createObjectStore('guideCleanupQueue', { keyPath: 'key' }).createIndex('cleanupAt', 'cleanupAt', { unique: false });
+      };
+      request.onsuccess = function() {
+        var database = request.result;
+        var transaction = database.transaction(['sources', 'guideGenerations', 'guideProgrammes'], 'readwrite');
+        transaction.objectStore('sources').put(JSON.stringify({ legacy: true }), 'legacy-source');
+        transaction.objectStore('guideGenerations').put({
+          key: 'legacy-generation', sourceKey: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          sourceStateKey: 'GS|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', feedId: 'prior-v3',
+          sourceEpoch: 1, sourceEpochKey: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|0000000000000001',
+          feedStateKey: 'legacy-feed', generation: 1, mutationEpoch: 1,
+          retention: { anchorMs: 1000, retainedFromMs: 1000, retainedUntilMs: 10000 },
+          channelPrefix: 'legacy-channel|', programmePrefix: 'legacy-programme|', status: 'active', expiresAt: 0,
+          batchCount: 1, inputChannelRows: 0, inputProgrammeRows: 2, channelCount: 0, programmeCount: 2,
+          cleanupStarted: false
+        });
+        var store = transaction.objectStore('guideProgrammes');
+        store.put({ key: 'legacy-finite', endKey: 'legacy-end-finite', generationKey: 'legacy-generation',
+          channelKey: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+          winnerKey: 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+          startMs: 500, endMs: 1500, effectiveEndMs: 1500, title: 'finite', subtitle: null,
+          description: null, categories: [], episode: null, artworkReference: null });
+        store.put({ key: 'legacy-open', endKey: 'legacy-end-open', generationKey: 'legacy-generation',
+          channelKey: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+          winnerKey: 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+          startMs: 800, endMs: null, effectiveEndMs: 3093527980800000, title: 'open', subtitle: null,
+          description: null, categories: [], episode: null, artworkReference: null });
+        transaction.oncomplete = function() { database.close(); resolve('ok'); };
+        transaction.onerror = function() { reject(transaction.error); };
+      };
+    })
+""")
+
+@Suppress("UNUSED_PARAMETER")
+private fun inspectLegacyV3GuideUpgrade(databaseName: String): Promise<String> = js("""
+    new Promise(function(resolve, reject) {
+      var request = indexedDB.open(databaseName);
+      request.onerror = function() { reject(request.error); };
+      request.onsuccess = function() {
+        var database = request.result;
+        var transaction = database.transaction(['sources', 'guideGenerations', 'guideProgrammes'], 'readonly');
+        var legacy = transaction.objectStore('sources').get('legacy-source');
+        var generation = transaction.objectStore('guideGenerations').get('legacy-generation');
+        var finite = transaction.objectStore('guideProgrammes').get('legacy-finite');
+        var open = transaction.objectStore('guideProgrammes').get('legacy-open');
+        transaction.oncomplete = function() {
+          var result = JSON.stringify({ version: database.version, legacy: JSON.parse(legacy.result).legacy,
+            maxFiniteSpanMs: generation.result.maxFiniteSpanMs, minStartMs: generation.result.minStartMs,
+            finiteStartMs: finite.result.finiteStartMs, openStartMs: open.result.openStartMs,
+            indexes: Array.from(database.transaction(['guideProgrammes'], 'readonly').objectStore('guideProgrammes').indexNames) });
+          database.close(); resolve(result);
+        };
+        transaction.onerror = function() { reject(transaction.error); };
+      };
+    })
+""")
+
+@Suppress("UNUSED_PARAMETER")
 private fun upgradeDatabaseToVersionFour(databaseName: String): Promise<String> = js("""
     new Promise(function(resolve, reject) {
-      var request = indexedDB.open(databaseName, 4);
+      var request = indexedDB.open(databaseName, 5);
       request.onerror = function() { reject(request.error); };
       request.onblocked = function() { reject(new Error('AIR_IDB_BLOCKED')); };
       request.onsuccess = function() {
