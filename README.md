@@ -48,6 +48,23 @@ documents under the app's no-backup directory. Provider credentials and
 configured URLs remain in the separate OS credential vault and never enter
 these documents or browser localStorage.
 
+Large media catalogs and TV guides use `DurableCatalogStore`, not observable
+whole-guide documents. Refreshes build private source/feed generations and
+atomically publish exact counts; failed, cancelled, stale, or crashed writers
+leave the previous snapshot readable. `DurableCatalogEpgStore` implements the
+IPTV `EpgStore` contract over that storage with bounded batching, rolling
+retention, leased cold search projections, revision-bound locators, now/next,
+multi-channel windows, conservative channel matching, and bounded matcher
+caches. Raw provider source/channel IDs and credential-bearing URLs are hashed
+or rejected before persistence.
+
+Android, JVM desktop, and Kotlin/Native use SQLDelight/SQLite with verified
+schema migrations and bounded cleanup. Browser JS and Wasm use IndexedDB v4.
+Its schema upgrade creates only empty stores; legacy v3 guide timelines migrate
+after open in bounded, yielding, crash-resumable batches while reads retain a
+correct legacy fallback. IndexedDB is a browser backend—it is not used by the
+Android TV application.
+
 Shell setup is one suspend call: `openAndroidLocalApplicationState`,
 `openAppleLocalApplicationState`, `openLinuxLocalApplicationState`,
 `openWindowsLocalApplicationState`, or `openBrowserLocalApplicationState`.
@@ -56,5 +73,8 @@ repositories without a DI container. Browser source credentials are
 intentionally session-only.
 
 ```bash
-./gradlew jvmTest jsNodeTest wasmJsNodeTest
+CHROME_BIN=/usr/bin/chromium AIR_SQLITE_LIBRARY_DIR=/usr/lib ./gradlew \
+  verifyCommonMainAirCatalogDatabaseMigration \
+  jvmTest jsBrowserTest wasmJsBrowserTest linuxX64Test \
+  compileDebugKotlinAndroid --max-workers=2
 ```
