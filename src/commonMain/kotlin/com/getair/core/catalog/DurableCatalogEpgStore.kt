@@ -54,11 +54,14 @@ class DurableCatalogEpgStore(
     private val limits: EpgStoreLimits = EpgStoreLimits(),
     private val ownsCatalogStore: Boolean = false,
 ) : EpgStore {
+    private companion object {
+        const val MAX_CHANNEL_CACHE_GUIDES = 32
+    }
     private val durable: DurableGuideStore = catalogs.guides
     private val locatorOwner = Any()
     private val mutex = Mutex()
     private val tickets = mutableMapOf<EpgGuideKey, Long>()
-    private val channelCaches = mutableMapOf<EpgGuideKey, ChannelCache>()
+    private val channelCaches = LinkedHashMap<EpgGuideKey, ChannelCache>()
     private var nextTicket = 0L
     private var closed = false
 
@@ -73,19 +76,25 @@ class DurableCatalogEpgStore(
     ): EpgRefreshResult {
         ensureOpen()
         val key = guide.durableKey()
-        val ticket = mutex.withLock {
+        val started = mutex.withLock {
             val value = ++nextTicket
             tickets[guide] = value
-            value
+            try {
+                value to durable.beginRefresh(
+                    key,
+                    DurableGuideRetention(
+                        retentionAnchor,
+                        retentionAnchor - retention.keepPastSeconds.seconds,
+                        retentionAnchor + retention.keepFutureSeconds.seconds,
+                    ),
+                )
+            } catch (failure: Throwable) {
+                if (tickets[guide] == value) tickets.remove(guide)
+                throw failure
+            }
         }
-        val generation = durable.beginRefresh(
-            key,
-            DurableGuideRetention(
-                retentionAnchor,
-                retentionAnchor - retention.keepPastSeconds.seconds,
-                retentionAnchor + retention.keepFutureSeconds.seconds,
-            ),
-        )
+        val ticket = started.first
+        val generation = started.second
         val retainedFrom = retentionAnchor - retention.keepPastSeconds.seconds
         val retainedUntil = retentionAnchor + retention.keepFutureSeconds.seconds
         var terminal = false
@@ -96,6 +105,11 @@ class DurableCatalogEpgStore(
         var invalid = 0
         var duplicates = 0
         var counts = DurableGuideCounts(0, 0)
+        var durableBatchesSeen = 0
+        var acceptedChannels = 0L
+        var acceptedProgrammes = 0L
+        var lastStageChannels = false
+        var lastStageProgrammes = false
         try {
             batches.collect { batch ->
                 currentCoroutineContext().ensureActive()
@@ -125,6 +139,11 @@ class DurableCatalogEpgStore(
                 pending.chunked(DurableGuideLimits.MAX_BATCH_ITEMS).forEach { chunk ->
                     val stagedChannels = chunk.mapNotNull { (it as? PendingRow.Channel)?.value }
                     val stagedProgrammes = chunk.mapNotNull { (it as? PendingRow.Programme)?.value }
+                    durableBatchesSeen++
+                    acceptedChannels += stagedChannels.size
+                    acceptedProgrammes += stagedProgrammes.size
+                    lastStageChannels = stagedChannels.isNotEmpty()
+                    lastStageProgrammes = stagedProgrammes.isNotEmpty()
                     val before = counts
                     counts = durable.stage(generation, stagedChannels, stagedProgrammes)
                     duplicates += stagedProgrammes.size - (counts.programmes - before.programmes).toInt()
@@ -161,7 +180,18 @@ class DurableCatalogEpgStore(
             }
             throw EpgStoreException.RefreshFailed()
         } catch (_: DurableGuideStoreException.Limit) {
-            throw EpgStoreException.LimitExceeded(EpgLimitKind.StoredProgrammes)
+            val kind = when {
+                durableBatchesSeen > DurableGuideLimits.MAX_GENERATION_BATCHES -> EpgLimitKind.Batches
+                acceptedChannels > DurableGuideLimits.MAX_INPUT_CHANNEL_ROWS -> EpgLimitKind.InputChannels
+                acceptedProgrammes > DurableGuideLimits.MAX_INPUT_PROGRAMME_ROWS -> EpgLimitKind.InputProgrammes
+                lastStageChannels &&
+                    counts.channels >= DurableGuideLimits.MAX_GENERATION_CHANNELS - DurableGuideLimits.MAX_BATCH_ITEMS ->
+                    EpgLimitKind.StoredChannels
+                lastStageProgrammes -> EpgLimitKind.StoredProgrammes
+                lastStageChannels -> EpgLimitKind.StoredChannels
+                else -> EpgLimitKind.Batches
+            }
+            throw EpgStoreException.LimitExceeded(kind)
         } catch (_: Exception) {
             throw EpgStoreException.RefreshFailed()
         } finally {
@@ -231,13 +261,13 @@ class DurableCatalogEpgStore(
             ?: return EpgChannelMatchAtRevision(null, EpgMatchResult.Unmatched)
         val transformed = entry.copy(
             id = PlaylistEntryId(hash("air-epg-entry-v1", guide.sourceId.value, entry.id.value)),
-            epgChannelId = entry.epgChannelId?.let { EpgChannelId(guide.channelDigest(it.value)) },
+            epgChannelId = entry.epgChannelId?.let { EpgChannelId(guide.channelHandle(it.value)) },
         )
         val overrides = buildMap {
             options.overrides.forEach { (rawKey, rawValue) ->
-                val value = EpgChannelId(guide.channelDigest(rawValue.value))
+                val value = EpgChannelId(guide.channelHandle(rawValue.value))
                 put(hash("air-epg-entry-v1", guide.sourceId.value, rawKey), value)
-                put(guide.channelDigest(rawKey), value)
+                put(guide.channelHandle(rawKey), value)
             }
         }
         val index = if (options.fuzzyPolicy == EpgFuzzyPolicy.Disabled) cache.exact else cache.fuzzy
@@ -285,6 +315,9 @@ class DurableCatalogEpgStore(
         val snapshot = durable.snapshot(guide.durableKey())
             ?: return EpgWindowResult(emptyList(), null, false, EpgQueryWork(1, 0, 0, 0))
         val unique = channelIds.distinct()
+        if (unique.isEmpty()) {
+            return EpgWindowResult(emptyList(), snapshot.revision, false, EpgQueryWork(1, 0, 0, 0))
+        }
         val lease = durable.acquire(snapshot)
             ?: return EpgWindowResult(emptyList(), null, false, EpgQueryWork(1, 0, 0, 0))
         return try {
@@ -333,9 +366,21 @@ class DurableCatalogEpgStore(
         )
         if (lower >= upper) {
             val removed = snapshot.counts.programmes.toInt()
-            durable.deleteGuide(key, snapshot.revision, snapshot.mutationEpoch)
-            mutex.withLock { channelCaches.remove(guide) }
-            return EpgPruneResult(true, null, removed, 0)
+            return when (val deleted = durable.deleteGuide(key, snapshot.revision, snapshot.mutationEpoch)) {
+                is DurableGuideDeleteResult.Deleted -> {
+                    mutex.withLock { channelCaches.remove(guide) }
+                    EpgPruneResult(true, deleted.revision, removed, 0)
+                }
+                is DurableGuideDeleteResult.Superseded -> {
+                    val current = deleted.current
+                    EpgPruneResult(
+                        current != null,
+                        current?.revision,
+                        0,
+                        current?.counts?.programmes?.toInt() ?: 0,
+                    )
+                }
+            }
         }
         return when (
             val result = durable.prune(
@@ -378,8 +423,12 @@ class DurableCatalogEpgStore(
     fun close() {
         if (closed) return
         closed = true
+        channelCaches.clear()
+        tickets.clear()
         if (ownsCatalogStore) catalogs.close()
     }
+
+    internal suspend fun channelCacheSize(): Int = mutex.withLock { channelCaches.size }
 
     private fun projectionRows(
         guide: EpgGuideKey,
@@ -415,7 +464,9 @@ class DurableCatalogEpgStore(
         snapshot: DurableGuideSnapshot,
         fuzzy: Boolean,
     ): ChannelCache? {
-        mutex.withLock { channelCaches[guide] }
+        mutex.withLock {
+            channelCaches.remove(guide)?.also { channelCaches[guide] = it }
+        }
             ?.takeIf { it.revision == snapshot.revision && (!fuzzy || it.fuzzyReady) }
             ?.let { return it }
         val lease = durable.acquire(snapshot) ?: return null
@@ -437,7 +488,7 @@ class DurableCatalogEpgStore(
         val fuzzyIndex = if (fuzzy) EpgChannelIndex.build(IptvGuide(rows, emptyList()), enableFuzzy = true) else exact
         val cache = ChannelCache(
             snapshot.revision,
-            rows.associateBy { DurableGuideChannelKey(it.id.value) },
+            rows.associateBy { DurableGuideChannelKey(channelDigestFromHandle(it.id.value)) },
             exact,
             fuzzyIndex,
             fuzzy,
@@ -448,6 +499,9 @@ class DurableCatalogEpgStore(
                 val old = channelCaches[guide]
                 if (old == null || old.revision != snapshot.revision || (fuzzy && !old.fuzzyReady)) {
                     channelCaches[guide] = cache
+                    while (channelCaches.size > MAX_CHANNEL_CACHE_GUIDES) {
+                        channelCaches.remove(channelCaches.keys.first())
+                    }
                     cache
                 } else old
             }
@@ -491,12 +545,15 @@ private fun EpgGuideKey.durableKey(): DurableGuideKey = DurableGuideKey(
     DurableGuideFeedId(feedId.value),
 )
 
-private fun EpgGuideKey.channelDigest(rawChannelId: String): String = hash(
-    "air-guide-channel-v1",
-    sourceId.value,
-    feedId.value,
-    rawChannelId,
-)
+private fun EpgGuideKey.channelDigest(rawChannelId: String): String =
+    if (isChannelHandle(rawChannelId)) {
+        channelDigestFromHandle(rawChannelId)
+    } else {
+        hash("air-guide-channel-v1", sourceId.value, feedId.value, rawChannelId)
+    }
+
+private fun EpgGuideKey.channelHandle(rawChannelId: String): String =
+    if (isChannelHandle(rawChannelId)) rawChannelId else CHANNEL_HANDLE_PREFIX + channelDigest(rawChannelId)
 
 private fun EpgChannel.toDurable(guide: EpgGuideKey): DurableGuideChannelRecord =
     DurableGuideChannelRecord(
@@ -523,14 +580,14 @@ private fun EpgProgramme.toDurable(guide: EpgGuideKey): DurableGuideProgrammeRec
     )
 
 private fun DurableGuideChannelRecord.toEpg(): EpgChannel = EpgChannel(
-    EpgChannelId(key.value),
+    EpgChannelId(CHANNEL_HANDLE_PREFIX + key.value),
     displayNames,
     artworkReference,
     emptyList(),
 )
 
 private fun DurableGuideProgrammeRecord.toEpg(
-    channelId: EpgChannelId = EpgChannelId(channelKey.value),
+    channelId: EpgChannelId = EpgChannelId(CHANNEL_HANDLE_PREFIX + channelKey.value),
 ): EpgProgramme = EpgProgramme(
     channelId,
     start,
@@ -585,3 +642,15 @@ private fun hash(domain: String, vararg values: String): String = sha256Hex(
         values.forEach { value -> append(value.encodeToByteArray().size).append(':').append(value).append(';') }
     }.encodeToByteArray(),
 )
+
+private const val CHANNEL_HANDLE_PREFIX = "air-epg:"
+
+private fun isChannelHandle(value: String): Boolean =
+    value.startsWith(CHANNEL_HANDLE_PREFIX) &&
+        value.removePrefix(CHANNEL_HANDLE_PREFIX).length == DurableGuideLimits.OPAQUE_DIGEST_CHARS &&
+        value.removePrefix(CHANNEL_HANDLE_PREFIX).all { it in '0'..'9' || it in 'a'..'f' }
+
+private fun channelDigestFromHandle(value: String): String =
+    value.removePrefix(CHANNEL_HANDLE_PREFIX).takeIf {
+        it.length == DurableGuideLimits.OPAQUE_DIGEST_CHARS && it.all { char -> char in '0'..'9' || char in 'a'..'f' }
+    } ?: error("Invalid durable channel handle")

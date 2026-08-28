@@ -95,7 +95,17 @@ class DurableCatalogEpgStoreTest {
             PlaylistEntryKind.Live,
             epgChannelId = rawChannel,
         )
-        assertIs<EpgMatchResult.Matched>(adapter.matchChannel(guide, entry).result)
+        val matched = assertIs<EpgMatchResult.Matched>(adapter.matchChannel(guide, entry).result)
+        assertTrue(matched.channel.id.value.startsWith("air-epg:"))
+        assertEquals("Morning", adapter.nowNext(guide, matched.channel.id, instant(11_000)).value.current?.title)
+        assertEquals(
+            2,
+            adapter.visibleWindow(guide, listOf(matched.channel.id), instant(8_000), instant(20_000))
+                .channels.single().programmes.size,
+        )
+        val emptyWindow = adapter.visibleWindow(guide, emptyList(), instant(8_000), instant(20_000))
+        assertEquals(info.revision, emptyWindow.revision)
+        assertTrue(emptyWindow.channels.isEmpty())
 
         val otherGuide = guide("source-one", "feed-two")
         adapter.refresh(
@@ -218,6 +228,79 @@ class DurableCatalogEpgStoreTest {
         adapter.close()
         assertTrue(catalog.closed)
     }
+
+    @Test
+    fun beginOrderingPruneCasCacheBoundAndLimitKinds() = runTest {
+        val base = ContractInMemoryDurableGuideStore()
+        val delayed = DelayedFirstBeginStore(base)
+        val adapter = DurableCatalogEpgStore(GuideOnlyCatalogStore(delayed))
+        val guide = guide("ordered-source", "ordered-feed")
+        val channelId = EpgChannelId("ordered-channel")
+        val batch = EpgBatch(
+            listOf(EpgChannel(channelId, listOf("Ordered"))),
+            listOf(programme(channelId, 1_000, 2_000, "First")),
+            1,
+            1,
+        )
+        val first = async { adapter.refresh(guide, flowOf(batch), instant(1_500)) }
+        delayed.entered.await()
+        val second = async {
+            adapter.refresh(
+                guide,
+                flowOf(batch.copy(programmes = listOf(programme(channelId, 2_000, 3_000, "Second")))),
+                instant(1_500),
+            )
+        }
+        delayed.release.complete(Unit)
+        first.await()
+        assertTrue(second.await().committed)
+        assertEquals(listOf(0, 1), delayed.completionOrder)
+        assertEquals(
+            "Second",
+            adapter.visibleWindow(guide, listOf(channelId), instant(0), instant(4_000))
+                .channels.single().programmes.single().title,
+        )
+
+        val superseding = DurableCatalogEpgStore(GuideOnlyCatalogStore(SupersedingDeleteStore(base)))
+        val before = assertNotNull(superseding.snapshotInfo(guide))
+        val prune = superseding.prune(guide, instant(1_000_000))
+        assertEquals(0, prune.removedProgrammes)
+        assertEquals(before.revision, superseding.snapshotInfo(guide)?.revision)
+
+        repeat(35) { index ->
+            val cacheGuide = guide("cache-source", "feed-$index")
+            adapter.refresh(cacheGuide, flowOf(batch), instant(1_500))
+            adapter.matchChannel(
+                cacheGuide,
+                IptvPlaylistEntry(
+                    PlaylistEntryId("entry-$index"),
+                    "Ordered",
+                    "https://stream.example.test/$index",
+                    PlaylistEntryKind.Live,
+                    epgChannelId = channelId,
+                ),
+            )
+        }
+        assertTrue(adapter.channelCacheSize() <= 32)
+
+        val limited = DurableCatalogEpgStore(GuideOnlyCatalogStore(AlwaysLimitStageStore(ContractInMemoryDurableGuideStore())))
+        val channelFailure = assertFailsWith<EpgStoreException.LimitExceeded> {
+            limited.refresh(
+                guide("limit-source", "channels"),
+                flowOf(EpgBatch(listOf(EpgChannel(channelId, listOf("Only"))), emptyList(), 1, 0)),
+                instant(1_500),
+            )
+        }
+        assertTrue(channelFailure.message.orEmpty().contains("channel"))
+        val programmeFailure = assertFailsWith<EpgStoreException.LimitExceeded> {
+            limited.refresh(
+                guide("limit-source", "programmes"),
+                flowOf(EpgBatch(emptyList(), listOf(programme(channelId, 1_000, 2_000, "Only")), 0, 1)),
+                instant(1_500),
+            )
+        }
+        assertTrue(programmeFailure.message.orEmpty().contains("programme"))
+    }
 }
 
 private fun guide(source: String, feed: String) = EpgGuideKey(SourceId(source), EpgFeedId(feed))
@@ -258,4 +341,47 @@ private class GuideOnlyCatalogStore(
     override suspend fun cleanupUnreachable(maxRows: Int): CatalogCleanupResult = unsupported()
     override fun close() { closed = true }
     private fun unsupported(): Nothing = error("Legacy catalog path is unsupported")
+}
+
+private class DelayedFirstBeginStore(
+    private val delegate: DurableGuideStore,
+) : DurableGuideStore by delegate {
+    val entered = CompletableDeferred<Unit>()
+    val release = CompletableDeferred<Unit>()
+    val completionOrder = mutableListOf<Int>()
+    private var calls = 0
+
+    override suspend fun beginRefresh(
+        key: DurableGuideKey,
+        retention: DurableGuideRetention,
+    ): DurableGuideGeneration {
+        val call = calls++
+        if (call == 0) {
+            entered.complete(Unit)
+            release.await()
+        }
+        val result = delegate.beginRefresh(key, retention)
+        completionOrder += call
+        return result
+    }
+}
+
+private class SupersedingDeleteStore(
+    private val delegate: DurableGuideStore,
+) : DurableGuideStore by delegate {
+    override suspend fun deleteGuide(
+        key: DurableGuideKey,
+        expectedRevision: Long?,
+        expectedMutationEpoch: Long?,
+    ): DurableGuideDeleteResult = DurableGuideDeleteResult.Superseded(delegate.snapshot(key))
+}
+
+private class AlwaysLimitStageStore(
+    delegate: DurableGuideStore,
+) : DurableGuideStore by delegate {
+    override suspend fun stage(
+        generation: DurableGuideGeneration,
+        channels: List<DurableGuideChannelRecord>,
+        programmes: List<DurableGuideProgrammeRecord>,
+    ): DurableGuideCounts = throw DurableGuideStoreException.Limit()
 }
