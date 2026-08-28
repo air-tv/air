@@ -3,6 +3,7 @@ package com.getair.core.persistence
 import com.getair.core.history.ContinueWatchingOptions
 import com.getair.core.history.ContinueWatchingSyncSource
 import com.getair.core.history.LocalFirstContinueWatchingRepository
+import com.getair.core.household.HouseholdProfileId
 import com.getair.core.household.HouseholdSyncSource
 import com.getair.core.household.LocalFirstHouseholdRepository
 import com.getair.core.source.LocalSourceRegistry
@@ -25,7 +26,17 @@ class LocalApplicationState internal constructor(
     val household: LocalFirstHouseholdRepository,
     val sources: LocalSourceRegistry,
     val continueWatching: LocalFirstContinueWatchingRepository,
-)
+) {
+    /**
+     * Removes a profile and its source assignments. Removing the household
+     * record first keeps a failed follow-up cleanup from exposing a source to
+     * another profile; retrying this command completes the idempotent cleanup.
+     */
+    suspend fun removeProfile(id: HouseholdProfileId) {
+        household.removeProfile(id)
+        sources.removeProfileAccess(id)
+    }
+}
 
 suspend fun openLocalApplicationState(
     documents: LocalDocumentStore,

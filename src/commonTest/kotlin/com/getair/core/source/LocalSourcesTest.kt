@@ -1,5 +1,6 @@
 package com.getair.core.source
 
+import com.getair.core.household.HouseholdProfileId
 import com.getair.iptv.XtreamCredentials
 import com.getair.iptv.model.StreamFormat
 import kotlinx.coroutines.test.runTest
@@ -8,8 +9,69 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class LocalSourcesTest {
+    @Test
+    fun filtersAllSourceKindsThroughOneProfileScope() = runTest {
+        val alex = HouseholdProfileId("alex")
+        val kids = HouseholdProfileId("kids")
+        val state = LocalSourceState(
+            profiles = listOf(
+                LocalSourceProfile(LocalSourceId("global-addon"), "Global addon", LocalSourceKind.StremioAddon),
+                LocalSourceProfile(
+                    LocalSourceId("alex-xtream"),
+                    "Alex TV",
+                    LocalSourceKind.Xtream,
+                    scope = LocalSourceScope.selectedProfiles(listOf(alex)),
+                ),
+                LocalSourceProfile(
+                    LocalSourceId("kids-list"),
+                    "Kids playlist",
+                    LocalSourceKind.M3u,
+                    enabled = false,
+                    scope = LocalSourceScope.selectedProfiles(listOf(kids)),
+                ),
+            ),
+        )
+
+        assertEquals(listOf("global-addon", "alex-xtream"), state.sourcesFor(alex).map { it.id.value })
+        assertEquals(listOf("global-addon"), state.sourcesFor(kids).map { it.id.value })
+        assertEquals(
+            listOf("global-addon", "kids-list"),
+            state.sourcesFor(kids, includeDisabled = true).map { it.id.value },
+        )
+    }
+
+    @Test
+    fun scopeChangesAndProfileRemovalAreIdempotentWithoutWideningAccess() = runTest {
+        val alex = HouseholdProfileId("alex")
+        val kids = HouseholdProfileId("kids")
+        val registry = LocalSourceRegistry(InMemoryLocalSourceStore(), InMemoryLocalSourceSecretStore())
+        val source = LocalSourceProfile(LocalSourceId("family-tv"), "Family TV", LocalSourceKind.M3u)
+        registry.upsert(source, M3uSourceSecret("https://provider.invalid/list.m3u"))
+        val selected = LocalSourceScope.selectedProfiles(listOf(alex, kids))
+
+        registry.setScope(source.id, selected)
+        val scopedRevision = registry.state.value.revision
+        registry.setScope(source.id, selected)
+        assertEquals(scopedRevision, registry.state.value.revision)
+
+        registry.removeProfileAccess(alex)
+        val afterRemoval = registry.state.value
+        assertTrue(afterRemoval.sourcesFor(alex).isEmpty())
+        assertEquals(listOf(source.id), afterRemoval.sourcesFor(kids).map(LocalSourceProfile::id))
+
+        registry.removeProfileAccess(kids)
+        val emptyScope = registry.state.value.profiles.single().scope
+        assertEquals(LocalSourceScope.selectedProfiles(emptyList()), emptyScope)
+        assertTrue(registry.state.value.sourcesFor(alex).isEmpty())
+        assertTrue(registry.state.value.sourcesFor(kids).isEmpty())
+        val emptyRevision = registry.state.value.revision
+        registry.removeProfileAccess(kids)
+        assertEquals(emptyRevision, registry.state.value.revision)
+    }
+
     @Test
     fun keepsMultiplePlaylistsIndependent() = runTest {
         val registry = LocalSourceRegistry(InMemoryLocalSourceStore(), InMemoryLocalSourceSecretStore())

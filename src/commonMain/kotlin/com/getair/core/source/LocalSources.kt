@@ -1,5 +1,6 @@
 package com.getair.core.source
 
+import com.getair.core.household.HouseholdProfileId
 import com.getair.iptv.StalkerCredentials
 import com.getair.iptv.XtreamCredentials
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -19,12 +20,41 @@ value class LocalSourceId(val value: String) {
 @Serializable
 enum class LocalSourceKind { Xtream, Stalker, M3u, StremioAddon }
 
+/**
+ * Which household profiles can use a source. This is non-secret, syncable
+ * metadata; provider URLs, credentials, and headers remain exclusively in
+ * [LocalSourceSecretStore].
+ */
+@Serializable
+sealed interface LocalSourceScope {
+    fun includes(profileId: HouseholdProfileId): Boolean
+
+    @Serializable
+    data object Global : LocalSourceScope {
+        override fun includes(profileId: HouseholdProfileId): Boolean = true
+    }
+
+    @Serializable
+    @ConsistentCopyVisibility
+    data class SelectedProfiles internal constructor(
+        val profileIds: Set<HouseholdProfileId>,
+    ) : LocalSourceScope {
+        override fun includes(profileId: HouseholdProfileId): Boolean = profileId in profileIds
+    }
+
+    companion object {
+        fun selectedProfiles(profileIds: Iterable<HouseholdProfileId>): LocalSourceScope =
+            SelectedProfiles(profileIds.toSet())
+    }
+}
+
 @Serializable
 data class LocalSourceProfile(
     val id: LocalSourceId,
     val name: String,
     val kind: LocalSourceKind,
     val enabled: Boolean = true,
+    val scope: LocalSourceScope = LocalSourceScope.Global,
 ) {
     init { require(name.isNotBlank() && name.length <= 80) }
 }
@@ -85,6 +115,14 @@ data class LocalSourceState(
         require(revision >= 0)
         require(profiles.map(LocalSourceProfile::id).distinct().size == profiles.size)
         require(profiles.map { it.name.lowercase() }.distinct().size == profiles.size)
+    }
+
+    /** A stable snapshot suitable for discovery, guide ingestion, and search work. */
+    fun sourcesFor(
+        profileId: HouseholdProfileId,
+        includeDisabled: Boolean = false,
+    ): List<LocalSourceProfile> = profiles.filter { source ->
+        (includeDisabled || source.enabled) && source.scope.includes(profileId)
     }
 }
 
@@ -164,6 +202,38 @@ class LocalSourceRegistry(
             it[index] = it[index].copy(enabled = enabled)
         }
         store.replace(previous.copy(profiles = profiles, revision = previous.revision + 1))
+    }
+
+    suspend fun setScope(id: LocalSourceId, scope: LocalSourceScope) = commands.withLock {
+        val previous = state.value
+        val index = previous.profiles.indexOfFirst { it.id == id }
+        require(index >= 0) { "Cannot update an unknown media source" }
+        if (previous.profiles[index].scope == scope) return@withLock
+        val profiles = previous.profiles.toMutableList().also {
+            it[index] = it[index].copy(scope = scope)
+        }
+        store.replace(previous.copy(profiles = profiles, revision = previous.revision + 1))
+    }
+
+    /**
+     * Removes a deleted household profile from every restricted source. An
+     * empty selection stays restricted to nobody; it never widens to global.
+     */
+    suspend fun removeProfileAccess(id: HouseholdProfileId) = commands.withLock {
+        val previous = state.value
+        var changed = false
+        val profiles = previous.profiles.map { source ->
+            val scope = source.scope
+            if (scope !is LocalSourceScope.SelectedProfiles || id !in scope.profileIds) {
+                source
+            } else {
+                changed = true
+                source.copy(scope = LocalSourceScope.selectedProfiles(scope.profileIds - id))
+            }
+        }
+        if (changed) {
+            store.replace(previous.copy(profiles = profiles, revision = previous.revision + 1))
+        }
     }
 
     suspend fun secret(id: LocalSourceId): LocalSourceSecret? = commands.withLock {

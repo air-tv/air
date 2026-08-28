@@ -10,11 +10,13 @@ import com.getair.core.source.LocalSourceId
 import com.getair.core.source.LocalSourceKind
 import com.getair.core.source.LocalSourceProfile
 import com.getair.core.source.LocalSourceState
+import com.getair.core.source.LocalSourceScope
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 
 class PersistentStateTest {
     @Test
@@ -103,5 +105,61 @@ class PersistentStateTest {
         assertFailsWith<IllegalArgumentException> { store.write("large.v1", "123456789") }
         store.remove("profile.v1")
         assertEquals(null, store.read("profile.v1"))
+    }
+
+    @Test
+    fun sourceScopesAreVersionedMetadataAndNeverContainCredentials() = runTest {
+        var encoded: String? = null
+        val documents = object : LocalDocumentStore {
+            override suspend fun read(document: String): String? = encoded
+            override suspend fun write(document: String, value: String) {
+                encoded = value
+            }
+            override suspend fun remove(document: String) {
+                encoded = null
+            }
+        }
+        val alex = HouseholdProfileId("alex")
+        val state = LocalSourceState(
+            profiles = listOf(
+                LocalSourceProfile(
+                    LocalSourceId("alex-addon"),
+                    "Alex addon",
+                    LocalSourceKind.StremioAddon,
+                    scope = LocalSourceScope.selectedProfiles(listOf(alex)),
+                ),
+            ),
+            revision = 7,
+        )
+
+        PersistentLocalSourceStore.open(documents).replace(state)
+
+        val document = requireNotNull(encoded)
+        assertTrue("\"version\":1" in document)
+        assertTrue("alex-addon" in document)
+        assertTrue("alex" in document)
+        assertFalse("manifestUrl" in document)
+        assertFalse("password" in document)
+        assertEquals(state, PersistentLocalSourceStore.open(documents).state.value)
+    }
+
+    @Test
+    fun sourceMetadataFromBeforeScopesDefaultsToGlobalAccess() = runTest {
+        val legacy = """
+            {"version":1,"value":{"profiles":[{"id":"legacy","name":"Legacy","kind":"M3u","enabled":true}],"revision":1}}
+        """.trimIndent()
+        val documents = object : LocalDocumentStore {
+            override suspend fun read(document: String): String = legacy
+            override suspend fun write(document: String, value: String) = Unit
+            override suspend fun remove(document: String) = Unit
+        }
+
+        val restored = PersistentLocalSourceStore.open(documents).state.value
+
+        assertEquals(LocalSourceScope.Global, restored.profiles.single().scope)
+        assertEquals(
+            listOf(LocalSourceId("legacy")),
+            restored.sourcesFor(HouseholdProfileId("any-profile")).map { it.id },
+        )
     }
 }
