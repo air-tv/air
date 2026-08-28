@@ -52,6 +52,28 @@ jobs:
       - run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
       - run: ./gradlew compileReleaseKotlinAndroid
 
+  windows-jvm-storage:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: air
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: air
+      - name: Check out public contract repositories
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/get-air/stremio-addon-client.git ../stremio-addon-client
+          git clone --depth 1 https://github.com/get-air/iptv.git ../iptv
+          git clone --depth 1 https://github.com/get-air/video.git ../video
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Verify atomic JVM document replacement on Windows
+        run: ./gradlew jvmTest --tests com.getair.core.persistence.JvmFileDocumentStoreTest
+
   native:
     strategy:
       fail-fast: false
