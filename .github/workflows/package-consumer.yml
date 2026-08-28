@@ -1,0 +1,37 @@
+name: Package Consumer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  clean-package-consumer:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: air
+    env:
+      AIR_USE_LOCAL_BUILDS: "false"
+      GITHUB_ACTOR: ${{ github.actor }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: air
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Verify pinned GitHub Packages without composite substitution
+        run: >-
+          ./gradlew
+          assertPackageDependencyMode
+          compileCommonMainKotlinMetadata
+          compileKotlinJvm
+          compileKotlinJs
+          compileKotlinWasmJs
+          --max-workers=2
+          --no-daemon

@@ -9,6 +9,12 @@ on:
 permissions:
   contents: read
 
+env:
+  AIR_USE_LOCAL_BUILDS: "true"
+  AIR_STREMIO_REF: 9b3ddd555d984b7bfd00a8225c29c3f4ae6f7692
+  AIR_IPTV_REF: 1efd247f601b67f3f70daf81480a483ba99c592c
+  AIR_VIDEO_REF: 7164066dd4b1bf74e45b2a50b80b1118cca4b54e
+
 jobs:
   portable:
     runs-on: ubuntu-latest
@@ -19,11 +25,21 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: air
-      - name: Check out public contract repositories
-        run: |
-          git clone --depth 1 https://github.com/get-air/stremio-addon-client.git ../stremio-addon-client
-          git clone --depth 1 https://github.com/get-air/iptv.git ../iptv
-          git clone --depth 1 https://github.com/get-air/video.git ../video
+      - uses: actions/checkout@v7
+        with:
+          repository: get-air/stremio-addon-client
+          ref: ${{ env.AIR_STREMIO_REF }}
+          path: stremio-addon-client
+      - uses: actions/checkout@v7
+        with:
+          repository: get-air/iptv
+          ref: ${{ env.AIR_IPTV_REF }}
+          path: iptv
+      - uses: actions/checkout@v7
+        with:
+          repository: get-air/video
+          ref: ${{ env.AIR_VIDEO_REF }}
+          path: video
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
@@ -50,11 +66,21 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: air
-      - name: Check out public contract repositories
-        run: |
-          git clone --depth 1 https://github.com/get-air/stremio-addon-client.git ../stremio-addon-client
-          git clone --depth 1 https://github.com/get-air/iptv.git ../iptv
-          git clone --depth 1 https://github.com/get-air/video.git ../video
+      - uses: actions/checkout@v7
+        with:
+          repository: get-air/stremio-addon-client
+          ref: ${{ env.AIR_STREMIO_REF }}
+          path: stremio-addon-client
+      - uses: actions/checkout@v7
+        with:
+          repository: get-air/iptv
+          ref: ${{ env.AIR_IPTV_REF }}
+          path: iptv
+      - uses: actions/checkout@v7
+        with:
+          repository: get-air/video
+          ref: ${{ env.AIR_VIDEO_REF }}
+          path: video
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
@@ -72,12 +98,21 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: air
-      - name: Check out public contract repositories
-        shell: bash
-        run: |
-          git clone --depth 1 https://github.com/get-air/stremio-addon-client.git ../stremio-addon-client
-          git clone --depth 1 https://github.com/get-air/iptv.git ../iptv
-          git clone --depth 1 https://github.com/get-air/video.git ../video
+      - uses: actions/checkout@v7
+        with:
+          repository: get-air/stremio-addon-client
+          ref: ${{ env.AIR_STREMIO_REF }}
+          path: stremio-addon-client
+      - uses: actions/checkout@v7
+        with:
+          repository: get-air/iptv
+          ref: ${{ env.AIR_IPTV_REF }}
+          path: iptv
+      - uses: actions/checkout@v7
+        with:
+          repository: get-air/video
+          ref: ${{ env.AIR_VIDEO_REF }}
+          path: video
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
@@ -107,12 +142,21 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: air
-      - name: Check out public contract repositories
-        shell: bash
-        run: |
-          git clone --depth 1 https://github.com/get-air/stremio-addon-client.git ../stremio-addon-client
-          git clone --depth 1 https://github.com/get-air/iptv.git ../iptv
-          git clone --depth 1 https://github.com/get-air/video.git ../video
+      - uses: actions/checkout@v7
+        with:
+          repository: get-air/stremio-addon-client
+          ref: ${{ env.AIR_STREMIO_REF }}
+          path: stremio-addon-client
+      - uses: actions/checkout@v7
+        with:
+          repository: get-air/iptv
+          ref: ${{ env.AIR_IPTV_REF }}
+          path: iptv
+      - uses: actions/checkout@v7
+        with:
+          repository: get-air/video
+          ref: ${{ env.AIR_VIDEO_REF }}
+          path: video
       - uses: actions/setup-java@v5
         with:
           distribution: temurin

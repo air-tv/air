@@ -1,7 +1,33 @@
 # Air application core
 
-Local-first Kotlin Multiplatform application state for Air. It consumes the
-real Stremio, IPTV, and video contracts through sibling composite builds.
+Local-first Kotlin Multiplatform application state for Air. Normal builds use
+pinned release coordinates for the Stremio, IPTV, and video contracts. GitHub
+Packages requires authentication even when these packages and repositories are
+public.
+
+For package consumption, provide credentials outside the repository through
+`GITHUB_ACTOR`/`GITHUB_TOKEN`, or through these entries in the user-level
+`~/.gradle/gradle.properties` file:
+
+```properties
+githubPackagesUser=YOUR_GITHUB_LOGIN
+githubPackagesToken=YOUR_READ_PACKAGES_TOKEN
+```
+
+Never add those values to this repository. Local source development is an
+explicit opt-in and requires all three sibling checkouts:
+
+```bash
+./gradlew -PuseLocalAirBuilds=true jvmTest --max-workers=2
+# Equivalent for CI/shell environments:
+AIR_USE_LOCAL_BUILDS=true ./gradlew jvmTest --max-workers=2
+```
+
+Merely placing a sibling directory beside Air never changes dependency
+resolution. CI composite builds also opt in explicitly and check out immutable
+commit SHAs. The manual `Package Consumer` workflow is the clean no-composite
+gate; it is intentionally not part of required main CI until every pinned
+package version exists.
 
 The default repository has no server. A future backend can implement
 `MediaSyncSource` without changing UI callers. TV authentication similarly

@@ -230,6 +230,24 @@ tasks.register("assertJvmCatalogDependencies") {
     }
 }
 
+tasks.register("assertPackageDependencyMode") {
+    group = "verification"
+    description = "Fails unless Air is resolving its pinned com.getair package coordinates."
+    doLast {
+        val local = providers.gradleProperty("useLocalAirBuilds")
+            .orElse(providers.environmentVariable("AIR_USE_LOCAL_BUILDS"))
+            .orNull
+            ?.trim()
+            ?.lowercase()
+            ?.let { it == "true" || it == "1" || it == "yes" }
+            ?: false
+        check(!local) { "Package verification cannot run with local composite substitution enabled" }
+        check(gradle.includedBuilds.isEmpty()) {
+            "Package verification found an included composite build"
+        }
+    }
+}
+
 tasks.configureEach {
     if (
         name == "verifyCommonMainAirCatalogDatabaseMigration" ||
