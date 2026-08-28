@@ -13,6 +13,12 @@ password, and sign-out transitions. Device codes are rejected locally at their
 expiry instant, and coroutine cancellation always propagates instead of being
 rendered as a fake authentication failure.
 
+`LocalFirstHouseholdRepository` owns the application-shell contract for
+household profiles and settings: per-profile playback, live-TV, subtitle/audio
+and rating choices plus device-level OLED, motion, density, refresh, decoder,
+timeout, response-limit and diagnostics settings. It is local by default and
+accepts a `HouseholdSyncSource` only when a future server exists.
+
 ```bash
 ./gradlew jvmTest jsNodeTest wasmJsNodeTest
 ```
