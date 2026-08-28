@@ -1,5 +1,10 @@
 import org.gradle.api.tasks.testing.Test
 import org.gradle.api.tasks.testing.logging.TestExceptionFormat
+import org.gradle.api.DefaultTask
+import org.gradle.api.provider.ListProperty
+import org.gradle.api.provider.Property
+import org.gradle.api.tasks.Input
+import org.gradle.api.tasks.TaskAction
 import org.jetbrains.kotlin.gradle.ExperimentalWasmDsl
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
@@ -230,22 +235,42 @@ tasks.register("assertJvmCatalogDependencies") {
     }
 }
 
-tasks.register("assertPackageDependencyMode") {
-    group = "verification"
-    description = "Fails unless Air is resolving its pinned com.getair package coordinates."
-    doLast {
-        val local = providers.gradleProperty("useLocalAirBuilds")
-            .orElse(providers.environmentVariable("AIR_USE_LOCAL_BUILDS"))
-            .orNull
-            ?.trim()
-            ?.lowercase()
-            ?.let { it == "true" || it == "1" || it == "yes" }
-            ?: false
-        check(!local) { "Package verification cannot run with local composite substitution enabled" }
-        check(gradle.includedBuilds.isEmpty()) {
+abstract class AssertPackageDependencyMode : DefaultTask() {
+    @get:Input
+    abstract val localBuildsEnabled: Property<Boolean>
+
+    @get:Input
+    abstract val includedBuildNames: ListProperty<String>
+
+    @TaskAction
+    fun verify() {
+        check(!localBuildsEnabled.get()) {
+            "Package verification cannot run with local composite substitution enabled"
+        }
+        check(includedBuildNames.get().isEmpty()) {
             "Package verification found an included composite build"
         }
     }
+}
+
+tasks.register<AssertPackageDependencyMode>("assertPackageDependencyMode") {
+    group = "verification"
+    description = "Fails unless Air is resolving its pinned com.getair package coordinates."
+    localBuildsEnabled.set(
+        providers.gradleProperty("useLocalAirBuilds")
+            .orElse(providers.environmentVariable("AIR_USE_LOCAL_BUILDS"))
+            .map { value ->
+                when (value.trim().lowercase()) {
+                    "true", "1", "yes" -> true
+                    "false", "0", "no" -> false
+                    else -> error("useLocalAirBuilds/AIR_USE_LOCAL_BUILDS must be true or false")
+                }
+            }
+            .orElse(false),
+    )
+    includedBuildNames.set(
+        gradle.includedBuilds.map { includedBuild -> includedBuild.name },
+    )
 }
 
 tasks.configureEach {
