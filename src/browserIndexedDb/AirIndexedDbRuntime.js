@@ -10,8 +10,23 @@
       channelRecords: "channelRecords",
       programmes: "programmes",
       counters: "counters",
+      guideStates: "guideStates",
+      guideGenerations: "guideGenerations",
+      guideChannels: "guideChannels",
+      guideProgrammes: "guideProgrammes",
+      guideLeases: "guideLeases",
+      guideCleanupQueue: "guideCleanupQueue",
     });
     const ALL_STORES = Object.freeze(Object.values(STORE));
+    const MEDIA_STORES = Object.freeze([
+      STORE.sources,
+      STORE.generations,
+      STORE.orphanQueue,
+      STORE.catalogRecords,
+      STORE.channelRecords,
+      STORE.programmes,
+      STORE.counters,
+    ]);
     const connections = new Map();
     const transactions = new Map();
 
@@ -41,8 +56,9 @@
       if (!root.indexedDB) return Promise.reject(error("AIR_IDB_UNAVAILABLE"));
       return new Promise((resolve, reject) => {
         let openRequest;
+        let blocked = false;
         try {
-          openRequest = root.indexedDB.open(name, 2);
+          openRequest = root.indexedDB.open(name, 3);
         } catch (failure) {
           reject(error(classify(failure)));
           return;
@@ -51,7 +67,7 @@
           const database = openRequest.result;
           if (event.oldVersion < 2) {
             for (const store of Array.from(database.objectStoreNames)) database.deleteObjectStore(store);
-            for (const store of ALL_STORES) {
+            for (const store of MEDIA_STORES) {
               if (store !== STORE.catalogRecords && store !== STORE.channelRecords) database.createObjectStore(store);
             }
             database.createObjectStore(STORE.catalogRecords, { keyPath: "recordKey" })
@@ -59,11 +75,54 @@
             database.createObjectStore(STORE.channelRecords, { keyPath: "recordKey" })
               .createIndex("orderKey", "orderKey", { unique: true });
           }
+          if (event.oldVersion < 3) {
+            if (!database.objectStoreNames.contains(STORE.guideStates)) {
+              database.createObjectStore(STORE.guideStates, { keyPath: "key" })
+                .createIndex("activeFeedKey", "activeFeedKey", { unique: true });
+            }
+            if (!database.objectStoreNames.contains(STORE.guideGenerations)) {
+              const generations = database.createObjectStore(STORE.guideGenerations, { keyPath: "key" });
+              generations.createIndex("sourceEpochKey", "sourceEpochKey", { unique: false });
+              generations.createIndex("sourceFeedGeneration", ["sourceKey", "feedId", "generation"], { unique: true });
+            }
+            if (!database.objectStoreNames.contains(STORE.guideChannels)) {
+              database.createObjectStore(STORE.guideChannels, { keyPath: "key" })
+                .createIndex("generationChannel", ["generationKey", "channelKey"], { unique: true });
+            }
+            if (!database.objectStoreNames.contains(STORE.guideProgrammes)) {
+              const programmes = database.createObjectStore(STORE.guideProgrammes, { keyPath: "key" });
+              programmes.createIndex("endKey", "endKey", { unique: true });
+              programmes.createIndex(
+                "generationChannelStart",
+                ["generationKey", "channelKey", "startMs"],
+                { unique: true },
+              );
+              programmes.createIndex(
+                "generationChannelEffectiveEnd",
+                ["generationKey", "channelKey", "effectiveEndMs", "startMs"],
+                { unique: true },
+              );
+              programmes.createIndex("generationLocator", ["generationKey", "key"], { unique: true });
+            }
+            if (!database.objectStoreNames.contains(STORE.guideLeases)) {
+              const leases = database.createObjectStore(STORE.guideLeases, { keyPath: "key" });
+              leases.createIndex("generationKey", "generationKey", { unique: false });
+              leases.createIndex("expiresAt", "expiresAt", { unique: false });
+            }
+            if (!database.objectStoreNames.contains(STORE.guideCleanupQueue)) {
+              database.createObjectStore(STORE.guideCleanupQueue, { keyPath: "key" })
+                .createIndex("cleanupAt", "cleanupAt", { unique: false });
+            }
+          }
         };
-        openRequest.onblocked = () => reject(error("AIR_IDB_BLOCKED"));
+        openRequest.onblocked = () => {
+          blocked = true;
+          reject(error("AIR_IDB_BLOCKED"));
+        };
         openRequest.onerror = () => reject(error(classify(openRequest.error)));
         openRequest.onsuccess = () => {
           const database = openRequest.result;
+          if (blocked) { database.close(); return; }
           database.onversionchange = () => {
             database.close();
             connections.delete(name);
@@ -210,6 +269,147 @@
         }
       };
       runNext();
+    };
+
+    const guideSourceState = (key, sourceKey) => ({
+      key: key,
+      kind: "source",
+      sourceKey: sourceKey,
+      epoch: 1,
+      mutation: 0,
+      activeFeedCount: 0,
+      stagedOnlyFeedCount: 0,
+      deleted: false,
+    });
+    const guideFeedState = (key, sourceKey, feedId, sourceEpoch) => ({
+      key: key,
+      kind: "feed",
+      sourceKey: sourceKey,
+      feedId: feedId,
+      sourceEpoch: sourceEpoch,
+      activeGeneration: null,
+      latestGeneration: null,
+      nextGeneration: 1,
+      revision: 0,
+      mutation: 0,
+      counts: { channels: 0, programmes: 0 },
+      retention: null,
+      deleted: false,
+    });
+    const guideSnapshot = (feed) => {
+      if (!feed || feed.deleted || feed.activeGeneration === null) return null;
+      return {
+        sourceKey: feed.sourceKey,
+        feedId: feed.feedId,
+        generation: feed.activeGeneration,
+        revision: feed.revision,
+        mutationEpoch: feed.mutation,
+        counts: feed.counts,
+        retention: feed.retention,
+      };
+    };
+    const compareNullable = (left, right, compare) => {
+      if (left === null && right === null) return 0;
+      if (left === null) return -1;
+      if (right === null) return 1;
+      return compare(left, right);
+    };
+    const compareStrings = (left, right) => {
+      const count = Math.min(left.length, right.length);
+      for (let index = 0; index < count; index += 1) {
+        if (left[index] < right[index]) return -1;
+        if (left[index] > right[index]) return 1;
+      }
+      return left.length - right.length;
+    };
+    const compareGuideChannels = (left, right) => {
+      let comparison = compareStrings(left.displayNames, right.displayNames);
+      if (comparison !== 0) return comparison;
+      return compareNullable(left.artworkReference, right.artworkReference, (a, b) => a < b ? -1 : (a > b ? 1 : 0));
+    };
+    const compareGuideProgrammes = (left, right) => {
+      const stringCompare = (a, b) => a < b ? -1 : (a > b ? 1 : 0);
+      let comparison = compareNullable(left.endMs, right.endMs, (a, b) => a - b);
+      if (comparison !== 0) return comparison;
+      comparison = stringCompare(left.title, right.title);
+      if (comparison !== 0) return comparison;
+      comparison = compareNullable(left.subtitle, right.subtitle, stringCompare);
+      if (comparison !== 0) return comparison;
+      comparison = compareNullable(left.description, right.description, stringCompare);
+      if (comparison !== 0) return comparison;
+      comparison = compareStrings(left.categories, right.categories);
+      if (comparison !== 0) return comparison;
+      comparison = compareNullable(left.artworkReference, right.artworkReference, stringCompare);
+      if (comparison !== 0) return comparison;
+      return compareNullable(left.episode, right.episode, stringCompare);
+    };
+    const encodedFieldBytes = (value) => 16 + (value === null ? 0 : new TextEncoder().encode(value).length);
+    const guideProgrammeBytes = (programme) =>
+      16 + encodedFieldBytes(programme.channelKey) + encodedFieldBytes(programme.winnerKey) +
+      encodedFieldBytes(programme.title) + encodedFieldBytes(programme.subtitle) +
+      encodedFieldBytes(programme.description) + encodedFieldBytes(programme.episode) +
+      encodedFieldBytes(programme.artworkReference) + 4 +
+      programme.categories.reduce((total, category) => total + encodedFieldBytes(category), 0);
+    const guideQueuePut = (tx, generationKey, cleanupAt, kind = "generation") => {
+      tx.objectStore(STORE.guideCleanupQueue).put({
+        key: "Q|" + generationKey,
+        generationKey: generationKey,
+        kind: kind,
+        cleanupAt: cleanupAt,
+      });
+    };
+    const guideLease = (tx, command, onValid, setResult, fail) => {
+      const leases = tx.objectStore(STORE.guideLeases);
+      if (!command.leaseKey) { fail("AIR_IDB_CORRUPT:missing-lease-key"); return; }
+      let request;
+      try { request = leases.get(command.leaseKey); } catch (failure) {
+        fail("AIR_IDB_CORRUPT");
+        return;
+      }
+      request.onerror = () => fail(classify(request.error));
+      request.onsuccess = () => {
+        const lease = request.result;
+        if (!lease || lease.ownerId !== command.ownerId || lease.expiresAt <= command.nowMs) {
+          setResult({ status: "stale" });
+          return;
+        }
+        if (!lease.generationKey) { fail("AIR_IDB_CORRUPT:missing-lease-generation-key"); return; }
+        let generationRequest;
+        try { generationRequest = tx.objectStore(STORE.guideGenerations).get(lease.generationKey); } catch (failure) {
+          fail("AIR_IDB_CORRUPT");
+          return;
+        }
+        generationRequest.onerror = () => fail(classify(generationRequest.error));
+        generationRequest.onsuccess = () => {
+          const generation = generationRequest.result;
+          if (!generation || generation.cleanupStarted) {
+            setResult({ status: "stale" });
+            return;
+          }
+          onValid(lease, generation);
+        };
+      };
+    };
+    const guideCursorPage = (store, range, direction, afterKey, limit, mapValue, done, fail) => {
+      const rows = [];
+      const lower = afterKey === null ? range.lower : afterKey;
+      const actualRange = IDBKeyRange.bound(lower, range.upper, afterKey !== null, false);
+      const request = store.openCursor(actualRange, direction || "next");
+      request.onerror = () => fail(classify(request.error));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) {
+          done(rows, null);
+          return;
+        }
+        if (rows.length >= limit) {
+          done(rows, rows.length === 0 ? null : rows[rows.length - 1].cursorKey);
+          return;
+        }
+        const mapped = mapValue(cursor.value, cursor.key);
+        if (mapped !== null) rows.push(mapped);
+        cursor.continue();
+      };
     };
 
     const execute = (name, text) => {
@@ -426,6 +626,900 @@
                 complete();
               };
             }, fail);
+          });
+        case "guideBegin":
+          return transaction(database, [STORE.guideStates, STORE.guideGenerations, STORE.guideCleanupQueue], "readwrite", command.operationId, (tx, setResult, fail) => {
+            const states = tx.objectStore(STORE.guideStates);
+            let source = null;
+            let feed = null;
+            let ready = 0;
+            const finish = () => {
+              ready += 1;
+              if (ready !== 2) return;
+              source = source || guideSourceState(command.sourceStateKey, command.sourceKey);
+              if (source.deleted) {
+                source.deleted = false;
+                source.activeFeedCount = 0;
+                source.stagedOnlyFeedCount = 0;
+              }
+              feed = feed || guideFeedState(command.feedStateKey, command.sourceKey, command.feedId, source.epoch);
+              if (feed.sourceEpoch !== source.epoch) {
+                feed.sourceEpoch = source.epoch;
+                feed.activeGeneration = null;
+                feed.latestGeneration = null;
+                feed.counts = { channels: 0, programmes: 0 };
+                feed.retention = null;
+                feed.deleted = false;
+                delete feed.activeFeedKey;
+              }
+              const allocate = () => {
+                const generation = feed.nextGeneration;
+                if (!Number.isSafeInteger(generation) || generation <= 0) { fail("AIR_IDB_GENERATION_EXHAUSTED"); return; }
+                const component = sortableKey(generation);
+                const generationKey = command.generationPrefix + component;
+                const wasStagedOnly = feed.activeGeneration === null && feed.latestGeneration !== null;
+                if (feed.activeGeneration === null && !wasStagedOnly) source.stagedOnlyFeedCount += 1;
+                feed.nextGeneration = generation + 1;
+                feed.latestGeneration = generation;
+                feed.mutation += 1;
+                feed.deleted = false;
+                source.mutation += 1;
+                const generationRow = {
+                  key: generationKey,
+                  sourceKey: command.sourceKey,
+                  sourceStateKey: command.sourceStateKey,
+                  feedId: command.feedId,
+                  sourceEpoch: source.epoch,
+                  sourceEpochKey: command.sourceKey + "|" + sortableKey(source.epoch),
+                  feedStateKey: command.feedStateKey,
+                  generation: generation,
+                  mutationEpoch: feed.mutation,
+                  retention: command.retention,
+                  channelPrefix: command.channelBase + component + "|",
+                  programmePrefix: command.programmeBase + component + "|",
+                  status: "staging",
+                  expiresAt: command.nowMs + command.generationIdleTimeoutMillis,
+                  batchCount: 0,
+                  inputChannelRows: 0,
+                  inputProgrammeRows: 0,
+                  channelCount: 0,
+                  programmeCount: 0,
+                  cleanupStarted: false,
+                };
+                states.put(source);
+                states.put(feed);
+                tx.objectStore(STORE.guideGenerations).put(generationRow);
+                guideQueuePut(tx, generationKey, generationRow.expiresAt);
+                setResult({ status: "ok", generation: generation, mutationEpoch: feed.mutation, sourceEpoch: source.epoch });
+              };
+              if (feed.latestGeneration === null) {
+                allocate();
+              } else {
+                const oldKey = command.generationPrefix + sortableKey(feed.latestGeneration);
+                const oldRequest = tx.objectStore(STORE.guideGenerations).get(oldKey);
+                oldRequest.onerror = () => fail(classify(oldRequest.error));
+                oldRequest.onsuccess = () => {
+                  const old = oldRequest.result;
+                  if (old) {
+                    old.status = "superseded";
+                    old.expiresAt = 0;
+                    tx.objectStore(STORE.guideGenerations).put(old);
+                    guideQueuePut(tx, old.key, 0);
+                  }
+                  allocate();
+                };
+              }
+            };
+            const sourceRequest = states.get(command.sourceStateKey);
+            sourceRequest.onerror = () => fail(classify(sourceRequest.error));
+            sourceRequest.onsuccess = () => { source = sourceRequest.result; finish(); };
+            const feedRequest = states.get(command.feedStateKey);
+            feedRequest.onerror = () => fail(classify(feedRequest.error));
+            feedRequest.onsuccess = () => { feed = feedRequest.result; finish(); };
+          });
+        case "guideRenewGeneration":
+        case "guideAbandon":
+          return transaction(database, [STORE.guideStates, STORE.guideGenerations, STORE.guideCleanupQueue], "readwrite", command.operationId, (tx, setResult, fail) => {
+            const generationRequest = tx.objectStore(STORE.guideGenerations).get(command.generationKey);
+            generationRequest.onerror = () => fail(classify(generationRequest.error));
+            generationRequest.onsuccess = () => {
+              const generation = generationRequest.result;
+              if (!generation || generation.status !== "staging") { setResult({ status: "terminal", value: false }); return; }
+              const feedRequest = tx.objectStore(STORE.guideStates).get(generation.feedStateKey);
+              feedRequest.onerror = () => fail(classify(feedRequest.error));
+              feedRequest.onsuccess = () => {
+                const feed = feedRequest.result;
+                if (!feed || feed.latestGeneration !== generation.generation || generation.expiresAt <= command.nowMs) {
+                  setResult({ status: "terminal", value: false });
+                  return;
+                }
+                if (command.op === "guideRenewGeneration") {
+                  generation.expiresAt = command.nowMs + command.generationIdleTimeoutMillis;
+                  tx.objectStore(STORE.guideGenerations).put(generation);
+                  guideQueuePut(tx, generation.key, generation.expiresAt);
+                  setResult({ status: "ok", value: true });
+                } else {
+                  const sourceRequest = tx.objectStore(STORE.guideStates).get(generation.sourceStateKey);
+                  sourceRequest.onerror = () => fail(classify(sourceRequest.error));
+                  sourceRequest.onsuccess = () => {
+                    const source = sourceRequest.result;
+                    generation.status = "abandoned";
+                    generation.expiresAt = 0;
+                    feed.latestGeneration = null;
+                    feed.mutation += 1;
+                    if (source && !source.deleted && source.epoch === generation.sourceEpoch) {
+                      if (feed.activeGeneration === null) {
+                        source.stagedOnlyFeedCount = Math.max(0, source.stagedOnlyFeedCount - 1);
+                      }
+                      source.mutation += 1;
+                      tx.objectStore(STORE.guideStates).put(source);
+                    }
+                    tx.objectStore(STORE.guideStates).put(feed);
+                    tx.objectStore(STORE.guideGenerations).put(generation);
+                    guideQueuePut(tx, generation.key, 0);
+                    setResult({ status: "ok", value: true });
+                  };
+                }
+              };
+            };
+          });
+        case "guideStage":
+          return transaction(database, [STORE.guideStates, STORE.guideGenerations, STORE.guideChannels, STORE.guideProgrammes, STORE.guideCleanupQueue], "readwrite", command.operationId, (tx, setResult, fail) => {
+            const generations = tx.objectStore(STORE.guideGenerations);
+            const generationRequest = generations.get(command.generationKey);
+            generationRequest.onerror = () => fail(classify(generationRequest.error));
+            generationRequest.onsuccess = () => {
+              const generation = generationRequest.result;
+              if (!generation || generation.status !== "staging" || generation.expiresAt <= command.nowMs) {
+                setResult({ status: "stale" }); return;
+              }
+              const feedRequest = tx.objectStore(STORE.guideStates).get(generation.feedStateKey);
+              feedRequest.onerror = () => fail(classify(feedRequest.error));
+              feedRequest.onsuccess = () => {
+                const feed = feedRequest.result;
+                if (!feed || feed.latestGeneration !== generation.generation) { setResult({ status: "stale" }); return; }
+                const batchItems = command.channels.length + command.programmes.length;
+                if (batchItems > command.maxBatchItems && generation.batchCount === 0) {
+                  setResult({ status: "limit" });
+                  return;
+                }
+                generation.batchCount += 1;
+                generation.inputChannelRows += command.channels.length;
+                generation.inputProgrammeRows += command.programmes.length;
+                if (
+                  generation.batchCount > command.maxBatches ||
+                  generation.inputChannelRows > command.maxInputChannels ||
+                  generation.inputProgrammeRows > command.maxInputProgrammes ||
+                  batchItems > command.maxBatchItems
+                ) {
+                  generation.status = "poisoned";
+                  generation.expiresAt = 0;
+                  generations.put(generation);
+                  guideQueuePut(tx, generation.key, 0);
+                  setResult({ status: "limit" });
+                  return;
+                }
+                const channelsStore = tx.objectStore(STORE.guideChannels);
+                const programmesStore = tx.objectStore(STORE.guideProgrammes);
+                const channelUpdates = [];
+                const programmeUpdates = [];
+                let pending = command.channels.length + command.programmes.length;
+                let addedChannels = 0;
+                let addedProgrammes = 0;
+                const complete = () => {
+                  if (pending !== 0) return;
+                  const channelCount = generation.channelCount + addedChannels;
+                  const programmeCount = generation.programmeCount + addedProgrammes;
+                  if (channelCount > command.maxChannels || programmeCount > command.maxProgrammes) {
+                    generations.put(generation);
+                    setResult({ status: "limit" });
+                    return;
+                  }
+                  channelUpdates.forEach((row) => channelsStore.put(row));
+                  programmeUpdates.forEach((row) => programmesStore.put(row));
+                  generation.channelCount = channelCount;
+                  generation.programmeCount = programmeCount;
+                  generation.expiresAt = command.nowMs + command.generationIdleTimeoutMillis;
+                  generations.put(generation);
+                  guideQueuePut(tx, generation.key, generation.expiresAt);
+                  setResult({ status: "ok", counts: { channels: channelCount, programmes: programmeCount } });
+                };
+                if (pending === 0) complete();
+                command.channels.forEach((candidate) => {
+                  candidate.sourceKey = generation.sourceKey;
+                  candidate.feedId = generation.feedId;
+                  candidate.generation = generation.generation;
+                  candidate.generationKey = generation.key;
+                  const request = channelsStore.get(candidate.key);
+                  request.onerror = () => fail(classify(request.error));
+                  request.onsuccess = () => {
+                    const current = request.result;
+                    if (!current) addedChannels += 1;
+                    if (!current || compareGuideChannels(candidate, current) < 0) channelUpdates.push(candidate);
+                    pending -= 1; complete();
+                  };
+                });
+                command.programmes.forEach((candidate) => {
+                  candidate.sourceKey = generation.sourceKey;
+                  candidate.feedId = generation.feedId;
+                  candidate.generation = generation.generation;
+                  candidate.generationKey = generation.key;
+                  const request = programmesStore.get(candidate.key);
+                  request.onerror = () => fail(classify(request.error));
+                  request.onsuccess = () => {
+                    const current = request.result;
+                    if (!current) addedProgrammes += 1;
+                    if (!current || compareGuideProgrammes(candidate, current) < 0) programmeUpdates.push(candidate);
+                    pending -= 1; complete();
+                  };
+                });
+              };
+            };
+          });
+        case "guideActivate":
+          return transaction(database, [STORE.guideStates, STORE.guideGenerations, STORE.guideCleanupQueue], "readwrite", command.operationId, (tx, setResult, fail) => {
+            const states = tx.objectStore(STORE.guideStates);
+            const generations = tx.objectStore(STORE.guideGenerations);
+            const generationRequest = generations.get(command.generationKey);
+            generationRequest.onerror = () => fail(classify(generationRequest.error));
+            generationRequest.onsuccess = () => {
+              const generation = generationRequest.result;
+              if (!generation) { setResult({ status: "stale" }); return; }
+              if (generation.status === "poisoned") { setResult({ status: "limit" }); return; }
+              const feedRequest = states.get(generation.feedStateKey);
+              feedRequest.onerror = () => fail(classify(feedRequest.error));
+              feedRequest.onsuccess = () => {
+                const feed = feedRequest.result;
+                if (!feed || feed.latestGeneration !== generation.generation || generation.status !== "staging") {
+                  setResult({ status: "superseded", current: guideSnapshot(feed) }); return;
+                }
+                if (generation.expiresAt <= command.nowMs) { setResult({ status: "stale" }); return; }
+                if (
+                  generation.channelCount !== command.expected.channels ||
+                  generation.programmeCount !== command.expected.programmes
+                ) { setResult({ status: "corrupt" }); return; }
+                if (generation.channelCount === 0 && generation.programmeCount === 0) {
+                  setResult({ status: "limit" }); return;
+                }
+                const sourceRequest = states.get(command.sourceStateKey);
+                sourceRequest.onerror = () => fail(classify(sourceRequest.error));
+                sourceRequest.onsuccess = () => {
+                  const source = sourceRequest.result;
+                  if (!source || source.deleted || source.epoch !== generation.sourceEpoch) {
+                    setResult({ status: "superseded", current: null }); return;
+                  }
+                  const oldGeneration = feed.activeGeneration;
+                  const hadActive = oldGeneration !== null;
+                  feed.activeGeneration = generation.generation;
+                  feed.latestGeneration = null;
+                  feed.revision += 1;
+                  feed.mutation = generation.mutationEpoch;
+                  feed.counts = { channels: generation.channelCount, programmes: generation.programmeCount };
+                  feed.retention = generation.retention;
+                  feed.deleted = false;
+                  feed.activeFeedKey = command.activeFeedBase + sortableKey(source.epoch) + "|" + command.feedComponent;
+                  generation.status = "active";
+                  generations.put(generation);
+                  tx.objectStore(STORE.guideCleanupQueue).delete("Q|" + generation.key);
+                  if (oldGeneration !== null && oldGeneration !== generation.generation) {
+                    const oldKey = command.generationPrefix + sortableKey(oldGeneration);
+                    const oldRequest = generations.get(oldKey);
+                    oldRequest.onsuccess = () => {
+                      const old = oldRequest.result;
+                      if (old) {
+                        old.status = "inactive";
+                        old.expiresAt = 0;
+                        generations.put(old);
+                        guideQueuePut(tx, old.key, 0);
+                      }
+                    };
+                  }
+                  if (!hadActive) {
+                    source.activeFeedCount += 1;
+                    source.stagedOnlyFeedCount = Math.max(0, source.stagedOnlyFeedCount - 1);
+                  }
+                  source.mutation += 1;
+                  states.put(feed);
+                  states.put(source);
+                  setResult({ status: "published", snapshot: guideSnapshot(feed) });
+                };
+              };
+            };
+          });
+        case "guideSnapshot":
+          return transaction(database, [STORE.guideStates], "readonly", command.operationId, (tx, setResult, fail) => {
+            const states = tx.objectStore(STORE.guideStates);
+            const sourceRequest = states.get(command.sourceStateKey);
+            sourceRequest.onerror = () => fail(classify(sourceRequest.error));
+            sourceRequest.onsuccess = () => {
+              const source = sourceRequest.result;
+              if (!source || source.deleted) { setResult(null); return; }
+              const feedRequest = states.get(command.feedStateKey);
+              feedRequest.onerror = () => fail(classify(feedRequest.error));
+              feedRequest.onsuccess = () => {
+                const feed = feedRequest.result;
+                setResult(feed && feed.sourceEpoch === source.epoch ? guideSnapshot(feed) : null);
+              };
+            };
+          });
+        case "guideSourceSnapshot":
+          return transaction(database, [STORE.guideStates], "readonly", command.operationId, (tx, setResult, fail) => {
+            const request = tx.objectStore(STORE.guideStates).get(command.sourceStateKey);
+            request.onerror = () => fail(classify(request.error));
+            request.onsuccess = () => {
+              const source = request.result || guideSourceState(command.sourceStateKey, command.sourceKey);
+              setResult({ status: "ok", sourceKey: command.sourceKey, epoch: source.epoch, mutation: source.mutation, feedCount: source.deleted ? 0 : source.activeFeedCount });
+            };
+          });
+        case "guideSnapshots":
+          return transaction(database, [STORE.guideStates], "readonly", command.operationId, (tx, setResult, fail) => {
+            const states = tx.objectStore(STORE.guideStates);
+            const sourceRequest = states.get(command.sourceStateKey);
+            sourceRequest.onerror = () => fail(classify(sourceRequest.error));
+            sourceRequest.onsuccess = () => {
+              const source = sourceRequest.result;
+              if (!source || source.epoch !== command.sourceEpoch || source.mutation !== command.sourceMutation) {
+                setResult({ status: "stale" }); return;
+              }
+              const prefix = command.activeFeedPrefix;
+              const lower = command.afterKey === null ? prefix : command.afterKey;
+              const range = IDBKeyRange.bound(lower, prefix + "\uffff", command.afterKey !== null, false);
+              const rows = [];
+              const cursorRequest = states.index("activeFeedKey").openCursor(range);
+              cursorRequest.onerror = () => fail(classify(cursorRequest.error));
+              cursorRequest.onsuccess = () => {
+                const cursor = cursorRequest.result;
+                if (!cursor || rows.length >= command.limit) {
+                  setResult({ status: "ok", rows: rows, nextKey: cursor ? rows[rows.length - 1].activeFeedKey : null });
+                  return;
+                }
+                const feed = cursor.value;
+                if (feed.sourceEpoch === source.epoch && !feed.deleted) rows.push(Object.assign(guideSnapshot(feed), { activeFeedKey: feed.activeFeedKey }));
+                cursor.continue();
+              };
+            };
+          });
+        case "guideAcquire":
+          return transaction(database, [STORE.guideGenerations, STORE.guideLeases], "readwrite", command.operationId, (tx, setResult, fail) => {
+            const generations = tx.objectStore(STORE.guideGenerations);
+            const generationRequest = generations.get(command.generationKey);
+            generationRequest.onerror = () => fail(classify(generationRequest.error));
+            generationRequest.onsuccess = () => {
+              const generation = generationRequest.result;
+              if (
+                !generation || generation.cleanupStarted || generation.generation !== command.generation
+              ) { setResult({ status: "missing" }); return; }
+              const leases = tx.objectStore(STORE.guideLeases);
+              const expiry = leases.index("expiresAt");
+              const expiredRequest = expiry.openCursor(IDBKeyRange.upperBound(command.nowMs));
+              let liveCount = 0;
+              expiredRequest.onerror = () => fail(classify(expiredRequest.error));
+              expiredRequest.onsuccess = () => {
+                const cursor = expiredRequest.result;
+                if (cursor) { cursor.delete(); cursor.continue(); return; }
+                const countRequest = leases.count();
+                countRequest.onerror = () => fail(classify(countRequest.error));
+                countRequest.onsuccess = () => {
+                  liveCount = countRequest.result;
+                  if (liveCount >= command.maxLiveLeases) { setResult({ status: "limit" }); return; }
+                  leases.put({
+                    key: command.leaseKey,
+                    ownerId: command.ownerId,
+                    generationKey: command.generationKey,
+                    expiresAt: command.nowMs + command.leaseIdleTimeoutMillis,
+                  });
+                  setResult({ status: "ok" });
+                };
+              };
+            };
+          });
+        case "guideRenewLease":
+        case "guideReleaseLease":
+          return transaction(database, [STORE.guideLeases, STORE.guideCleanupQueue], "readwrite", command.operationId, (tx, setResult, fail) => {
+            const leases = tx.objectStore(STORE.guideLeases);
+            const request = leases.get(command.leaseKey);
+            request.onerror = () => fail(classify(request.error));
+            request.onsuccess = () => {
+              const lease = request.result;
+              if (!lease || lease.ownerId !== command.ownerId) { setResult({ status: "ok", value: false }); return; }
+              if (command.op === "guideReleaseLease") {
+                leases.delete(lease.key);
+                const queue = tx.objectStore(STORE.guideCleanupQueue);
+                const queueRequest = queue.get("Q|" + lease.generationKey);
+                queueRequest.onerror = () => fail(classify(queueRequest.error));
+                queueRequest.onsuccess = () => {
+                  const queueRow = queueRequest.result;
+                  if (queueRow) { queueRow.cleanupAt = 0; queue.put(queueRow); }
+                  setResult({ status: "ok", value: true });
+                };
+              } else if (lease.expiresAt <= command.nowMs) {
+                leases.delete(lease.key);
+                setResult({ status: "ok", value: false });
+              } else {
+                lease.expiresAt = command.nowMs + command.leaseIdleTimeoutMillis;
+                leases.put(lease);
+                setResult({ status: "ok", value: true });
+              }
+            };
+          });
+        case "guideChannels":
+          return transaction(database, [STORE.guideLeases, STORE.guideGenerations, STORE.guideChannels], "readonly", command.operationId, (tx, setResult, fail) => {
+            guideLease(tx, command, (_lease, generation) => {
+              const prefix = command.channelPrefix;
+              guideCursorPage(
+                tx.objectStore(STORE.guideChannels),
+                { lower: prefix, upper: prefix + "\uffff" },
+                "next",
+                command.afterKey,
+                command.limit,
+                (row, key) => Object.assign({ cursorKey: key }, row),
+                (rows, nextKey) => setResult({ status: "ok", rows: rows, nextKey: nextKey }),
+                fail,
+              );
+            }, setResult, fail);
+          });
+        case "guideSearchRows":
+        case "guideFullProgrammes":
+          return transaction(database, [STORE.guideLeases, STORE.guideGenerations, STORE.guideProgrammes], "readonly", command.operationId, (tx, setResult, fail) => {
+            guideLease(tx, command, (_lease, generation) => {
+              const prefix = command.programmePrefix;
+              guideCursorPage(
+                tx.objectStore(STORE.guideProgrammes),
+                { lower: prefix, upper: prefix + "\uffff" },
+                "next",
+                command.afterKey,
+                command.limit,
+                (row, key) => command.op === "guideSearchRows"
+                  ? {
+                      cursorKey: key,
+                      locatorKey: key,
+                      startMs: row.startMs,
+                      effectiveEndMs: row.effectiveEndMs,
+                      title: row.title,
+                      subtitle: row.subtitle,
+                    }
+                  : Object.assign({ cursorKey: key, locatorKey: key }, row),
+                (rows, nextKey) => setResult({ status: "ok", rows: rows, nextKey: nextKey }),
+                fail,
+              );
+            }, setResult, fail);
+          });
+        case "guideProgramme":
+          return transaction(database, [STORE.guideLeases, STORE.guideGenerations, STORE.guideProgrammes], "readonly", command.operationId, (tx, setResult, fail) => {
+            guideLease(tx, command, (_lease, generation) => {
+              if (command.locatorGenerationKey !== generation.key || !command.locatorKey.startsWith(command.programmePrefix)) {
+                setResult({ status: "ok", row: null }); return;
+              }
+              const request = tx.objectStore(STORE.guideProgrammes).get(command.locatorKey);
+              request.onerror = () => fail(classify(request.error));
+              request.onsuccess = () => setResult({ status: "ok", row: request.result || null });
+            }, setResult, fail);
+          });
+        case "durableGuideWindow":
+          return transaction(database, [STORE.guideLeases, STORE.guideGenerations, STORE.guideProgrammes], "readonly", command.operationId, (tx, setResult, fail) => {
+            guideLease(tx, command, (_lease, generation) => {
+              const prefix = command.channelProgrammePrefix;
+              const lower = command.afterKey === null ? prefix : command.afterKey;
+              const upper = prefix + command.untilKey;
+              const range = IDBKeyRange.bound(lower, upper, command.afterKey !== null, true);
+              const rows = [];
+              let payloadBytes = 0;
+              const request = tx.objectStore(STORE.guideProgrammes).openCursor(range);
+              request.onerror = () => fail(classify(request.error));
+              request.onsuccess = () => {
+                const cursor = request.result;
+                if (!cursor) { setResult({ status: "ok", rows: rows, nextKey: null, truncated: false, payloadBytes: payloadBytes }); return; }
+                const row = cursor.value;
+                if (row.effectiveEndMs <= command.fromMs) { cursor.continue(); return; }
+                const bytes = guideProgrammeBytes(row);
+                if (rows.length >= command.limit || payloadBytes + bytes > command.payloadByteLimit) {
+                  setResult({
+                    status: "ok",
+                    rows: rows,
+                    nextKey: rows.length === 0 ? command.afterKey : rows[rows.length - 1].cursorKey,
+                    truncated: true,
+                    payloadBytes: payloadBytes,
+                  });
+                  return;
+                }
+                rows.push(Object.assign({ cursorKey: cursor.key, locatorKey: cursor.key }, row));
+                payloadBytes += bytes;
+                cursor.continue();
+              };
+            }, setResult, fail);
+          });
+        case "guideNowNext":
+          return transaction(database, [STORE.guideLeases, STORE.guideGenerations, STORE.guideProgrammes], "readonly", command.operationId, (tx, setResult, fail) => {
+            guideLease(tx, command, (_lease, generation) => {
+              const store = tx.objectStore(STORE.guideProgrammes);
+              const prefix = command.channelProgrammePrefix;
+              let current = undefined;
+              let next = undefined;
+              const complete = () => {
+                if (current !== undefined && next !== undefined) setResult({ status: "ok", current: current, next: next });
+              };
+              const currentRequest = store.openCursor(
+                IDBKeyRange.bound(prefix, prefix + command.atKey + "|\uffff"),
+                "prev",
+              );
+              currentRequest.onerror = () => fail(classify(currentRequest.error));
+              currentRequest.onsuccess = () => {
+                const cursor = currentRequest.result;
+                if (!cursor) { current = null; complete(); return; }
+                const row = cursor.value;
+                if (row.effectiveEndMs > command.atMs) { current = row; complete(); } else cursor.continue();
+              };
+              const nextRequest = store.openCursor(
+                IDBKeyRange.bound(prefix + command.atKey + "|\uffff", prefix + "\uffff", true, false),
+                "next",
+              );
+              nextRequest.onerror = () => fail(classify(nextRequest.error));
+              nextRequest.onsuccess = () => {
+                const cursor = nextRequest.result;
+                next = cursor ? cursor.value : null;
+                complete();
+              };
+            }, setResult, fail);
+          });
+        case "guideBeginPrune":
+          return transaction(database, [STORE.guideStates, STORE.guideGenerations, STORE.guideCleanupQueue], "readwrite", command.operationId, (tx, setResult, fail) => {
+            const states = tx.objectStore(STORE.guideStates);
+            const feedRequest = states.get(command.feedStateKey);
+            feedRequest.onerror = () => fail(classify(feedRequest.error));
+            feedRequest.onsuccess = () => {
+              const feed = feedRequest.result;
+              if (
+                !feed || feed.deleted || feed.activeGeneration === null ||
+                feed.revision !== command.expectedRevision || feed.mutation !== command.expectedMutationEpoch
+              ) { setResult({ status: "superseded", current: guideSnapshot(feed) }); return; }
+              if (
+                command.retention.anchorMs !== feed.retention.anchorMs ||
+                command.retention.retainedFromMs < feed.retention.retainedFromMs ||
+                command.retention.retainedUntilMs > feed.retention.retainedUntilMs
+              ) { setResult({ status: "limit" }); return; }
+              const sourceRequest = states.get(command.sourceStateKey);
+              sourceRequest.onerror = () => fail(classify(sourceRequest.error));
+              sourceRequest.onsuccess = () => {
+                const source = sourceRequest.result;
+                if (!source || source.deleted || source.epoch !== feed.sourceEpoch) {
+                  setResult({ status: "superseded", current: null }); return;
+                }
+                const generations = tx.objectStore(STORE.guideGenerations);
+                const allocate = () => {
+                  const generation = feed.nextGeneration;
+                  const component = sortableKey(generation);
+                  const generationKey = command.generationPrefix + component;
+                  feed.nextGeneration = generation + 1;
+                  feed.latestGeneration = generation;
+                  feed.mutation += 1;
+                  source.mutation += 1;
+                  const row = {
+                    key: generationKey,
+                    sourceKey: command.sourceKey,
+                    feedId: command.feedId,
+                    sourceEpoch: source.epoch,
+                    sourceEpochKey: command.sourceKey + "|" + sortableKey(source.epoch),
+                    feedStateKey: command.feedStateKey,
+                    generation: generation,
+                    mutationEpoch: feed.mutation,
+                    retention: command.retention,
+                    channelPrefix: command.channelBase + component + "|",
+                    programmePrefix: command.programmeBase + component + "|",
+                    status: "staging",
+                    purpose: "prune",
+                    expiresAt: command.nowMs + command.generationIdleTimeoutMillis,
+                    batchCount: 0,
+                    inputChannelRows: 0,
+                    inputProgrammeRows: 0,
+                    channelCount: 0,
+                    programmeCount: 0,
+                    cleanupStarted: false,
+                  };
+                  states.put(feed); states.put(source); generations.put(row);
+                  guideQueuePut(tx, row.key, row.expiresAt);
+                  setResult({ status: "ok", generation: generation, mutationEpoch: feed.mutation, sourceEpoch: source.epoch });
+                };
+                if (feed.latestGeneration === null) { allocate(); return; }
+                const oldKey = command.generationPrefix + sortableKey(feed.latestGeneration);
+                const oldRequest = generations.get(oldKey);
+                oldRequest.onerror = () => fail(classify(oldRequest.error));
+                oldRequest.onsuccess = () => {
+                  const old = oldRequest.result;
+                  if (old) { old.status = "superseded"; old.expiresAt = 0; generations.put(old); guideQueuePut(tx, old.key, 0); }
+                  allocate();
+                };
+              };
+            };
+          });
+        case "guideFinishPruneUnchanged":
+          return transaction(database, [STORE.guideStates, STORE.guideGenerations, STORE.guideCleanupQueue], "readwrite", command.operationId, (tx, setResult, fail) => {
+            const generations = tx.objectStore(STORE.guideGenerations);
+            const request = generations.get(command.generationKey);
+            request.onerror = () => fail(classify(request.error));
+            request.onsuccess = () => {
+              const generation = request.result;
+              if (!generation || generation.status !== "staging") { setResult({ status: "stale" }); return; }
+              const states = tx.objectStore(STORE.guideStates);
+              const feedRequest = states.get(generation.feedStateKey);
+              feedRequest.onerror = () => fail(classify(feedRequest.error));
+              feedRequest.onsuccess = () => {
+                const feed = feedRequest.result;
+                if (!feed || feed.latestGeneration !== generation.generation) {
+                  setResult({ status: "superseded", current: guideSnapshot(feed) }); return;
+                }
+                generation.status = "abandoned"; generation.expiresAt = 0;
+                feed.latestGeneration = null;
+                generations.put(generation); states.put(feed); guideQueuePut(tx, generation.key, 0);
+                setResult({ status: "unchanged", current: guideSnapshot(feed) });
+              };
+            };
+          });
+        case "guideDelete":
+          return transaction(database, [STORE.guideStates, STORE.guideGenerations, STORE.guideCleanupQueue], "readwrite", command.operationId, (tx, setResult, fail) => {
+            const states = tx.objectStore(STORE.guideStates);
+            const sourceRequest = states.get(command.sourceStateKey);
+            sourceRequest.onerror = () => fail(classify(sourceRequest.error));
+            sourceRequest.onsuccess = () => {
+              const source = sourceRequest.result || guideSourceState(command.sourceStateKey, command.sourceKey);
+              const feedRequest = states.get(command.feedStateKey);
+              feedRequest.onerror = () => fail(classify(feedRequest.error));
+              feedRequest.onsuccess = () => {
+                const feed = feedRequest.result || guideFeedState(command.feedStateKey, command.sourceKey, command.feedId, source.epoch);
+                if (command.conditional && (
+                  feed.activeGeneration === null || feed.revision !== command.expectedRevision ||
+                  feed.mutation !== command.expectedMutationEpoch
+                )) { setResult({ status: "superseded", current: guideSnapshot(feed) }); return; }
+                const generations = tx.objectStore(STORE.guideGenerations);
+                const mark = (generation, status) => {
+                  if (generation === null) return;
+                  const key = command.generationPrefix + sortableKey(generation);
+                  const request = generations.get(key);
+                  request.onsuccess = () => {
+                    const row = request.result;
+                    if (row) { row.status = status; row.expiresAt = 0; generations.put(row); guideQueuePut(tx, row.key, 0); }
+                  };
+                };
+                const hadActive = feed.activeGeneration !== null;
+                const hadStagedOnly = !hadActive && feed.latestGeneration !== null;
+                mark(feed.activeGeneration, "inactive");
+                mark(feed.latestGeneration, "abandoned");
+                feed.activeGeneration = null;
+                feed.latestGeneration = null;
+                feed.revision += 1;
+                feed.mutation += 1;
+                feed.deleted = true;
+                feed.counts = { channels: 0, programmes: 0 };
+                feed.retention = null;
+                delete feed.activeFeedKey;
+                if (hadActive) source.activeFeedCount = Math.max(0, source.activeFeedCount - 1);
+                if (hadStagedOnly) source.stagedOnlyFeedCount = Math.max(0, source.stagedOnlyFeedCount - 1);
+                source.mutation += 1;
+                states.put(feed); states.put(source);
+                setResult({ status: "deleted", revision: feed.revision });
+              };
+            };
+          });
+        case "guideDeleteSource":
+          return transaction(database, [STORE.guideStates, STORE.guideCleanupQueue], "readwrite", command.operationId, (tx, setResult, fail) => {
+            const states = tx.objectStore(STORE.guideStates);
+            const request = states.get(command.sourceStateKey);
+            request.onerror = () => fail(classify(request.error));
+            request.onsuccess = () => {
+              const source = request.result || guideSourceState(command.sourceStateKey, command.sourceKey);
+              if (command.conditional && (source.epoch !== command.sourceEpoch || source.mutation !== command.sourceMutation)) {
+                setResult({ status: "superseded", activeFeedCount: source.deleted ? 0 : source.activeFeedCount, stagedOnlyFeedCount: source.deleted ? 0 : source.stagedOnlyFeedCount });
+                return;
+              }
+              const active = source.deleted ? 0 : source.activeFeedCount;
+              const staged = source.deleted ? 0 : source.stagedOnlyFeedCount;
+              const oldEpoch = source.epoch;
+              source.epoch += 1;
+              source.mutation += 1;
+              source.activeFeedCount = 0;
+              source.stagedOnlyFeedCount = 0;
+              source.deleted = true;
+              states.put(source);
+              tx.objectStore(STORE.guideCleanupQueue).put({
+                key: "QS|" + command.sourceKey + "|" + sortableKey(oldEpoch),
+                kind: "source",
+                sourceKey: command.sourceKey,
+                sourceEpoch: oldEpoch,
+                cleanupAt: 0,
+              });
+              setResult({ status: "deleted", activeFeedCount: active, stagedOnlyFeedCount: staged });
+            };
+          });
+        case "guideCleanup":
+          return transaction(database, [
+            STORE.guideStates,
+            STORE.guideGenerations,
+            STORE.guideChannels,
+            STORE.guideProgrammes,
+            STORE.guideLeases,
+            STORE.guideCleanupQueue,
+          ], "readwrite", command.operationId, (tx, setResult, fail) => {
+            const queue = tx.objectStore(STORE.guideCleanupQueue);
+            const queueIndex = queue.index("cleanupAt");
+            const finish = (removedRows) => {
+              const countRequest = queueIndex.count(IDBKeyRange.upperBound(command.nowMs));
+              countRequest.onerror = () => fail(classify(countRequest.error));
+              countRequest.onsuccess = () => setResult({
+                status: "ok",
+                removedRows: removedRows,
+                hasMore: countRequest.result > 0,
+              });
+            };
+            const processGeneration = (generation, queueRow) => {
+              if (!generation) {
+                queue.delete(queueRow.key);
+                finish(0);
+                return;
+              }
+              if (generation.status === "staging" && generation.expiresAt > command.nowMs) {
+                queueRow.cleanupAt = generation.expiresAt;
+                queue.put(queueRow);
+                finish(0);
+                return;
+              }
+              const leases = tx.objectStore(STORE.guideLeases);
+              const leaseRequest = leases.index("generationKey").openCursor(IDBKeyRange.only(generation.key));
+              let liveLeaseExpiry = null;
+              leaseRequest.onerror = () => fail(classify(leaseRequest.error));
+              leaseRequest.onsuccess = () => {
+                const cursor = leaseRequest.result;
+                if (cursor) {
+                  const lease = cursor.value;
+                  if (lease.expiresAt <= command.nowMs) cursor.delete();
+                  else liveLeaseExpiry = liveLeaseExpiry === null ? lease.expiresAt : Math.min(liveLeaseExpiry, lease.expiresAt);
+                  cursor.continue();
+                  return;
+                }
+                if (liveLeaseExpiry !== null) {
+                  queueRow.cleanupAt = liveLeaseExpiry;
+                  queue.put(queueRow);
+                  finish(0);
+                  return;
+                }
+                generation.cleanupStarted = true;
+                generation.status = generation.status === "staging" ? "expired" : generation.status;
+                tx.objectStore(STORE.guideGenerations).put(generation);
+                let remaining = command.maxRows;
+                let removed = 0;
+                const tasks = [
+                  [STORE.guideChannels, generation.channelPrefix],
+                  [STORE.guideProgrammes, generation.programmePrefix],
+                ];
+                let taskIndex = 0;
+                const runTask = () => {
+                  if (remaining === 0 || taskIndex >= tasks.length) { checkEmpty(); return; }
+                  const task = tasks[taskIndex++];
+                  const request = tx.objectStore(task[0]).openCursor(rangeForPrefix(task[1]));
+                  request.onerror = () => fail(classify(request.error));
+                  request.onsuccess = () => {
+                    const cursor = request.result;
+                    if (!cursor || remaining === 0) { runTask(); return; }
+                    cursor.delete();
+                    remaining -= 1;
+                    removed += 1;
+                    cursor.continue();
+                  };
+                };
+                const checkEmpty = () => {
+                  const channelsCount = tx.objectStore(STORE.guideChannels).count(rangeForPrefix(generation.channelPrefix));
+                  const programmesCount = tx.objectStore(STORE.guideProgrammes).count(rangeForPrefix(generation.programmePrefix));
+                  let pending = 2;
+                  let total = 0;
+                  const done = (request) => {
+                    total += request.result;
+                    pending -= 1;
+                    if (pending !== 0) return;
+                    if (total === 0) {
+                      tx.objectStore(STORE.guideGenerations).delete(generation.key);
+                      if (queueRow.kind === "source") {
+                        queueRow.cleanupAt = 0;
+                        queue.put(queueRow);
+                      } else {
+                        queue.delete(queueRow.key);
+                      }
+                      const states = tx.objectStore(STORE.guideStates);
+                      const feedRequest = states.get(generation.feedStateKey);
+                      feedRequest.onsuccess = () => {
+                        const feed = feedRequest.result;
+                        if (feed && feed.sourceEpoch === generation.sourceEpoch && feed.latestGeneration === generation.generation) {
+                          feed.latestGeneration = null;
+                          feed.mutation += 1;
+                          states.put(feed);
+                          const sourceRequest = states.get("GS|" + generation.sourceKey);
+                          sourceRequest.onsuccess = () => {
+                            const source = sourceRequest.result;
+                            if (source && source.epoch === generation.sourceEpoch && !source.deleted) {
+                              if (feed.activeGeneration === null) source.stagedOnlyFeedCount = Math.max(0, source.stagedOnlyFeedCount - 1);
+                              source.mutation += 1;
+                              states.put(source);
+                            }
+                          };
+                        }
+                      };
+                    } else {
+                      queueRow.cleanupAt = 0;
+                      queue.put(queueRow);
+                    }
+                    finish(removed);
+                  };
+                  channelsCount.onerror = () => fail(classify(channelsCount.error));
+                  programmesCount.onerror = () => fail(classify(programmesCount.error));
+                  channelsCount.onsuccess = () => done(channelsCount);
+                  programmesCount.onsuccess = () => done(programmesCount);
+                };
+                runTask();
+              };
+            };
+            const queueRequest = queueIndex.openCursor(IDBKeyRange.upperBound(command.nowMs));
+            queueRequest.onerror = () => fail(classify(queueRequest.error));
+            queueRequest.onsuccess = () => {
+              const cursor = queueRequest.result;
+              if (!cursor) { setResult({ status: "ok", removedRows: 0, hasMore: false }); return; }
+              const queueRow = cursor.value;
+              if (queueRow.kind === "source") {
+                const sourceEpochKey = queueRow.sourceKey + "|" + sortableKey(queueRow.sourceEpoch);
+                const generationRequest = tx.objectStore(STORE.guideGenerations)
+                  .index("sourceEpochKey").openCursor(IDBKeyRange.only(sourceEpochKey));
+                generationRequest.onerror = () => fail(classify(generationRequest.error));
+                generationRequest.onsuccess = () => {
+                  const generationCursor = generationRequest.result;
+                  if (!generationCursor) { queue.delete(queueRow.key); finish(0); return; }
+                  const generation = generationCursor.value;
+                  processGeneration(generation, {
+                    key: queueRow.key,
+                    kind: "source",
+                    sourceKey: queueRow.sourceKey,
+                    sourceEpoch: queueRow.sourceEpoch,
+                    generationKey: generation.key,
+                    cleanupAt: 0,
+                  });
+                };
+              } else {
+                const generationRequest = tx.objectStore(STORE.guideGenerations).get(queueRow.generationKey);
+                generationRequest.onerror = () => fail(classify(generationRequest.error));
+                generationRequest.onsuccess = () => processGeneration(generationRequest.result, queueRow);
+              }
+            };
+          });
+        case "guideDebugDump":
+          return transaction(database, [
+            STORE.guideStates,
+            STORE.guideGenerations,
+            STORE.guideChannels,
+            STORE.guideProgrammes,
+            STORE.guideLeases,
+            STORE.guideCleanupQueue,
+          ], "readonly", command.operationId, (tx, setResult, fail) => {
+            const stores = [
+              STORE.guideStates,
+              STORE.guideGenerations,
+              STORE.guideChannels,
+              STORE.guideProgrammes,
+              STORE.guideLeases,
+              STORE.guideCleanupQueue,
+            ];
+            const records = [];
+            let index = 0;
+            const nextStore = () => {
+              if (index >= stores.length || records.length >= command.limit) {
+                setResult({ status: "ok", records: records });
+                return;
+              }
+              const request = tx.objectStore(stores[index++]).openCursor();
+              request.onerror = () => fail(classify(request.error));
+              request.onsuccess = () => {
+                const cursor = request.result;
+                if (!cursor) { nextStore(); return; }
+                records.push(stringify(cursor.value));
+                if (records.length >= command.limit) setResult({ status: "ok", records: records });
+                else cursor.continue();
+              };
+            };
+            nextStore();
           });
         case "deleteSource":
           return transaction(database, [STORE.sources, STORE.generations, STORE.orphanQueue], "readwrite", command.operationId, (tx, setResult, fail) => {

@@ -12,6 +12,18 @@ suspend fun openBrowserDurableCatalogStore(
     options = options,
 )
 
+internal suspend fun openBrowserDurableCatalogStoreForTest(
+    databaseName: String,
+    options: CatalogStorageOptions = CatalogStorageOptions(),
+    nowMillis: () -> Long,
+): DurableCatalogStore = openIndexedDbDurableCatalogStore(
+    databaseName = databaseName,
+    executor = JsIndexedDbExecutor,
+    options = options,
+    nowMillis = nowMillis,
+    cleanupGuidesOnStartup = false,
+)
+
 private object JsIndexedDbExecutor : BrowserIndexedDbExecutor {
     override suspend fun execute(
         databaseName: String,

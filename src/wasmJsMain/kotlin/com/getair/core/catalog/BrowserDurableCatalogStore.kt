@@ -13,6 +13,18 @@ suspend fun openBrowserDurableCatalogStore(
     options = options,
 )
 
+internal suspend fun openBrowserDurableCatalogStoreForTest(
+    databaseName: String,
+    options: CatalogStorageOptions = CatalogStorageOptions(),
+    nowMillis: () -> Long,
+): DurableCatalogStore = openIndexedDbDurableCatalogStore(
+    databaseName = databaseName,
+    executor = WasmIndexedDbExecutor,
+    options = options,
+    nowMillis = nowMillis,
+    cleanupGuidesOnStartup = false,
+)
+
 private object WasmIndexedDbExecutor : BrowserIndexedDbExecutor {
     override suspend fun execute(
         databaseName: String,

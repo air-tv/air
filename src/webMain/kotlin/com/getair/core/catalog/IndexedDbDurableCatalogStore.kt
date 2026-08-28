@@ -57,12 +57,13 @@ internal suspend fun openIndexedDbDurableCatalogStore(
     executor: BrowserIndexedDbExecutor,
     options: CatalogStorageOptions = CatalogStorageOptions(),
     nowMillis: () -> Long = { Clock.System.now().toEpochMilliseconds() },
+    cleanupGuidesOnStartup: Boolean = true,
 ): DurableCatalogStore {
     require(databaseName.isNotBlank() && databaseName.length <= 128 && '\u0000' !in databaseName) {
         "IndexedDB database name must be between 1 and 128 characters"
     }
     return IndexedDbDurableCatalogStore(databaseName, executor, nowMillis).also { store ->
-        store.initialize(options.startupCleanupRows)
+        store.initialize(options.startupCleanupRows, cleanupGuidesOnStartup)
     }
 }
 
@@ -74,10 +75,12 @@ private class IndexedDbDurableCatalogStore(
     private val writes = Mutex()
     private var nextOperation = 0L
     private var closed = false
+    override val guides: DurableGuideStore = IndexedDbDurableGuideStore(databaseName, executor, nowMillis)
 
-    suspend fun initialize(startupCleanupRows: Int) {
+    suspend fun initialize(startupCleanupRows: Int, cleanupGuidesOnStartup: Boolean) {
         command("open") { }
         cleanupUnreachable(startupCleanupRows)
+        if (cleanupGuidesOnStartup) guides.cleanupUnreachable(startupCleanupRows)
     }
 
     override suspend fun beginRefresh(sourceId: LocalSourceId): CatalogGeneration = writes.withLock {
