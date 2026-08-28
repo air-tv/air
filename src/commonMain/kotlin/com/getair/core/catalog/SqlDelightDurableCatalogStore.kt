@@ -45,6 +45,7 @@ internal class SqlDelightDurableCatalogStore(
     dispatcher: CoroutineDispatcher = Dispatchers.Default.limitedParallelism(1),
     private val nowMillis: () -> Long = { Clock.System.now().toEpochMilliseconds() },
     private val writeProbe: CatalogWriteProbe = CatalogWriteProbe.None,
+    guideReadProbe: GuideReadProbe = GuideReadProbe.None,
 ) : DurableCatalogStore {
     private val database = AirCatalogDatabase(driver)
     private val queries: CatalogQueries = database.catalogQueries
@@ -57,6 +58,7 @@ internal class SqlDelightDurableCatalogStore(
         dispatcher = databaseDispatcher,
         writer = writer,
         nowMillis = nowMillis,
+        readProbe = guideReadProbe,
     )
 
     override suspend fun beginRefresh(sourceId: LocalSourceId): CatalogGeneration = serializedWrite {

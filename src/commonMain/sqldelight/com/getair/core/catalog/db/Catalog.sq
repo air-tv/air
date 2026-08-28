@@ -62,7 +62,11 @@ ON epg_programme(source_id, generation, channel_id, end_ms, start_ms);
 
 CREATE TABLE guide_source_state (
   source_key TEXT NOT NULL PRIMARY KEY,
-  mutation_epoch INTEGER NOT NULL DEFAULT 0 CHECK (mutation_epoch >= 0)
+  mutation_epoch INTEGER NOT NULL DEFAULT 0 CHECK (mutation_epoch >= 0),
+  delete_epoch INTEGER NOT NULL DEFAULT 0 CHECK (delete_epoch >= 0),
+  active_feed_count INTEGER NOT NULL DEFAULT 0 CHECK (active_feed_count >= 0),
+  staged_only_feed_count INTEGER NOT NULL DEFAULT 0 CHECK (staged_only_feed_count >= 0),
+  deleted INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1))
 );
 
 CREATE TABLE guide_state (
@@ -73,12 +77,16 @@ CREATE TABLE guide_state (
   next_generation INTEGER NOT NULL DEFAULT 1 CHECK (next_generation > 0),
   revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
   mutation_epoch INTEGER NOT NULL DEFAULT 0 CHECK (mutation_epoch >= 0),
+  source_epoch INTEGER NOT NULL DEFAULT 0 CHECK (source_epoch >= 0),
   deleted INTEGER NOT NULL DEFAULT 1 CHECK (deleted IN (0, 1)),
   PRIMARY KEY (source_key, feed_id)
 );
 
 CREATE INDEX guide_state_source_active
-ON guide_state(source_key, deleted, feed_id);
+ON guide_state(source_key, source_epoch, deleted, feed_id);
+
+CREATE INDEX guide_state_source_feed_epoch
+ON guide_state(source_key, feed_id, source_epoch);
 
 CREATE TABLE guide_generation (
   source_key TEXT NOT NULL,
@@ -163,6 +171,9 @@ CREATE TABLE guide_lease (
 CREATE INDEX guide_lease_owner_expiry
 ON guide_lease(owner_id, expires_at_ms, lease_id);
 
+CREATE INDEX guide_lease_expiry
+ON guide_lease(expires_at_ms, lease_id);
+
 CREATE INDEX guide_lease_generation_expiry
 ON guide_lease(source_key, feed_id, generation, expires_at_ms);
 
@@ -176,6 +187,16 @@ CREATE TABLE guide_cleanup_queue (
 
 CREATE INDEX guide_cleanup_order
 ON guide_cleanup_queue(enqueued_at_ms, source_key, feed_id, generation);
+
+CREATE TABLE guide_source_cleanup (
+  source_key TEXT NOT NULL PRIMARY KEY,
+  delete_epoch INTEGER NOT NULL CHECK (delete_epoch > 0),
+  after_feed_id TEXT NOT NULL DEFAULT '',
+  enqueued_at_ms INTEGER NOT NULL
+);
+
+CREATE INDEX guide_source_cleanup_order
+ON guide_source_cleanup(enqueued_at_ms, source_key);
 
 ensureSource:
 INSERT OR IGNORE INTO catalog_source(source_id) VALUES (?);

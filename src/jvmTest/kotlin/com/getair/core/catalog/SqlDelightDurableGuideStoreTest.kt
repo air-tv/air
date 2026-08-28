@@ -7,12 +7,16 @@ import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.sql.DriverManager
 import java.util.Properties
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
 import kotlinx.coroutines.test.runTest
 import kotlin.io.path.createTempDirectory
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -103,6 +107,9 @@ class SqlDelightDurableGuideStoreTest {
                 plans.joinToString(),
             )
             assertTrue(plans.any { "guide_programme_locator" in it }, plans.joinToString())
+            assertTrue(plans.any { "guide_lease_expiry" in it }, plans.joinToString())
+            assertTrue(plans.any { "guide_generation_expiry" in it }, plans.joinToString())
+            assertTrue(plans.any { "guide_state" in it && "INDEX" in it }, plans.joinToString())
             assertTrue(plans.none { "USE TEMP B-TREE" in it }, plans.joinToString())
 
             val unsafe = runCatching {
@@ -136,16 +143,175 @@ class SqlDelightDurableGuideStoreTest {
         }
     }
 
-    private fun openStore(path: Path, clock: () -> Long): SqlDelightDurableCatalogStore {
+    @Test
+    fun sourceDeletionIsImmediateAndFanoutAdvancesOneFeedPerCleanupUnit() = runTest {
+        val directory = createTempDirectory("air-guide-source-delete-")
+        val path = directory.resolve("catalog.db")
+        try {
+            val store = openStore(path) { 50_000L }
+            val sourceKey = guideKey("large-source", "seed").sourceKey
+            repeat(64) { index ->
+                publishOne(store.guides, DurableGuideKey(sourceKey, DurableGuideFeedId("feed-$index")))
+            }
+            val before = store.guides.sourceSnapshot(sourceKey)
+            assertEquals(64, before.feedCount)
+            val deleted = store.guides.deleteSource(sourceKey, before.token)
+                as DurableGuideSourceDeleteResult.Deleted
+            assertEquals(64, deleted.activeFeedCount)
+            assertEquals(0, store.guides.sourceSnapshot(sourceKey).feedCount)
+            assertTrue(store.guides.snapshots(store.guides.sourceSnapshot(sourceKey), limit = 10).snapshots.isEmpty())
+            assertEquals(
+                64,
+                scalar(
+                    path,
+                    "SELECT COUNT(*) FROM guide_state WHERE source_key='${sourceKey.value}' AND active_generation IS NOT NULL",
+                ),
+            )
+
+            val cleanup = store.guides.cleanupUnreachable(1)
+            val work = (store.guides as SqlDelightDurableGuideStore).lastCleanupWorkForTest
+            assertEquals(0, cleanup.removedRows)
+            assertEquals(1, work.retiredSourceFeeds)
+            assertEquals(1, work.total)
+            assertEquals(
+                63,
+                scalar(
+                    path,
+                    "SELECT COUNT(*) FROM guide_state WHERE source_key='${sourceKey.value}' AND active_generation IS NOT NULL",
+                ),
+            )
+            assertTrue(cleanup.hasMore)
+            publishOne(store.guides, DurableGuideKey(sourceKey, DurableGuideFeedId("replacement")))
+            val revived = store.guides.sourceSnapshot(sourceKey)
+            assertEquals(1, revived.feedCount)
+            assertEquals(
+                listOf("replacement"),
+                store.guides.snapshots(revived, limit = 10).snapshots.map { it.key.feedId.value },
+            )
+            repeat(4) { store.guides.cleanupUnreachable(1) }
+            assertEquals(1, store.guides.sourceSnapshot(sourceKey).feedCount)
+            store.close()
+        } finally {
+            directory.toFile().deleteRecursively()
+        }
+    }
+
+    @Test
+    fun leaseAdmissionCapIsGlobalAcrossBackendOwners() = runTest {
+        val directory = createTempDirectory("air-guide-global-leases-")
+        val path = directory.resolve("catalog.db")
+        var now = 60_000L
+        try {
+            val first = openStore(path) { now }
+            val key = guideKey("leases", "main")
+            publishOne(first.guides, key)
+            val second = openStore(path) { now }
+            val firstSnapshot = checkNotNull(first.guides.snapshot(key))
+            val secondSnapshot = checkNotNull(second.guides.snapshot(key))
+            val firstLeases = List(DurableGuideLimits.MAX_LIVE_LEASES / 2) {
+                checkNotNull(first.guides.acquire(firstSnapshot))
+            }
+            val secondLeases = List(DurableGuideLimits.MAX_LIVE_LEASES - firstLeases.size - 1) {
+                checkNotNull(second.guides.acquire(secondSnapshot))
+            }
+            val firstRace = async(Dispatchers.IO) {
+                try {
+                    Result.success(checkNotNull(first.guides.acquire(firstSnapshot)))
+                } catch (failure: Throwable) {
+                    Result.failure(failure)
+                }
+            }
+            val secondRace = async(Dispatchers.IO) {
+                try {
+                    Result.success(checkNotNull(second.guides.acquire(secondSnapshot)))
+                } catch (failure: Throwable) {
+                    Result.failure(failure)
+                }
+            }
+            val raced = listOf(firstRace.await(), secondRace.await())
+            assertEquals(1, raced.count(Result<DurableGuideSnapshotLease>::isSuccess))
+            assertEquals(1, raced.count { it.exceptionOrNull() is DurableGuideStoreException.Limit })
+            val racedLease = raced.single { it.isSuccess }.getOrThrow()
+            assertFailsWith<DurableGuideStoreException.Limit> { first.guides.acquire(firstSnapshot) }
+            now += first.guides.leaseIdleTimeoutMillis + 1
+            first.guides.cleanupUnreachable(1)
+            val cleanupWork = (first.guides as SqlDelightDurableGuideStore).lastCleanupWorkForTest
+            assertEquals(1, cleanupWork.expiredLeases)
+            assertEquals(1, cleanupWork.total)
+            assertEquals(
+                (DurableGuideLimits.MAX_LIVE_LEASES - 1).toLong(),
+                scalar(path, "SELECT COUNT(*) FROM guide_lease"),
+            )
+            val replacement = checkNotNull(first.guides.acquire(firstSnapshot))
+            first.guides.release(replacement)
+            if (raced.first().isSuccess) first.guides.release(racedLease) else second.guides.release(racedLease)
+            firstLeases.forEach { first.guides.release(it) }
+            secondLeases.forEach { second.guides.release(it) }
+            second.close()
+            first.close()
+        } finally {
+            directory.toFile().deleteRecursively()
+        }
+    }
+
+    @Test
+    fun sourcePageAndTokenShareOneSqliteReadSnapshotAcrossConnections() = runTest {
+        val directory = createTempDirectory("air-guide-source-race-")
+        val path = directory.resolve("catalog.db")
+        val validated = CountDownLatch(1)
+        val continueRead = CountDownLatch(1)
+        try {
+            val reader = openStore(
+                path,
+                readProbe = GuideReadProbe {
+                    validated.countDown()
+                    check(continueRead.await(5, TimeUnit.SECONDS))
+                },
+                clock = { 70_000L },
+            )
+            val sourceKey = guideKey("race", "one").sourceKey
+            publishOne(reader.guides, DurableGuideKey(sourceKey, DurableGuideFeedId("one")))
+            val writer = openStore(path) { 70_000L }
+            val source = reader.guides.sourceSnapshot(sourceKey)
+            val page = async(Dispatchers.IO) { reader.guides.snapshots(source, limit = 10) }
+            assertTrue(validated.await(5, TimeUnit.SECONDS))
+            val writerStarted = CountDownLatch(1)
+            val publish = async(Dispatchers.IO) {
+                writerStarted.countDown()
+                publishOne(writer.guides, DurableGuideKey(sourceKey, DurableGuideFeedId("two")))
+            }
+            assertTrue(writerStarted.await(5, TimeUnit.SECONDS))
+            continueRead.countDown()
+            val captured = page.await()
+            publish.await()
+            assertEquals(source.feedCount, captured.snapshots.size)
+            assertFailsWith<DurableGuideStoreException.Stale> {
+                reader.guides.snapshots(source, limit = 10)
+            }
+            writer.close()
+            reader.close()
+        } finally {
+            continueRead.countDown()
+            directory.toFile().deleteRecursively()
+        }
+    }
+
+    private fun openStore(
+        path: Path,
+        readProbe: GuideReadProbe = GuideReadProbe.None,
+        clock: () -> Long,
+    ): SqlDelightDurableCatalogStore {
         val driver = JdbcSqliteDriver(
             url = "jdbc:sqlite:${path.toAbsolutePath()}",
             properties = Properties(),
             schema = AirCatalogDatabase.Schema,
         )
+        driver.execute(null, "PRAGMA busy_timeout=5000", 0)
         return SqlDelightDurableCatalogStore(
             driver = driver,
             dispatcher = Dispatchers.IO.limitedParallelism(1),
             nowMillis = clock,
+            guideReadProbe = readProbe,
         )
     }
 

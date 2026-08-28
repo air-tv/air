@@ -19,6 +19,14 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlin.math.min
 
+internal fun interface GuideReadProbe {
+    fun afterSourceTokenValidated()
+
+    companion object {
+        val None = GuideReadProbe { }
+    }
+}
+
 /**
  * SQLite implementation of the feed-scoped durable guide contract.
  *
@@ -31,12 +39,16 @@ internal class SqlDelightDurableGuideStore(
     private val dispatcher: CoroutineDispatcher,
     private val writer: Mutex,
     private val nowMillis: () -> Long,
+    private val readProbe: GuideReadProbe = GuideReadProbe.None,
 ) : DurableGuideStore {
     override val leaseIdleTimeoutMillis: Long = DurableGuideLimits.DEFAULT_LEASE_IDLE_TIMEOUT_MILLIS
     override val generationIdleTimeoutMillis: Long = DurableGuideLimits.DEFAULT_GENERATION_IDLE_TIMEOUT_MILLIS
 
     private val owner = Any()
     private val ownerId = "${nowMillis().toString(16)}-${owner.hashCode().toUInt().toString(16)}"
+
+    internal var lastCleanupWorkForTest: GuideCleanupWork = GuideCleanupWork()
+        private set
 
     override suspend fun beginRefresh(
         key: DurableGuideKey,
@@ -47,20 +59,28 @@ internal class SqlDelightDurableGuideStore(
         var mutation = 0L
         database.transaction {
             ensureSourceAndGuide(key)
-            val state = requireNotNull(state(key))
+            val source = requireNotNull(sourceState(key.sourceKey))
+            var state = requireNotNull(state(key))
+            if (state.sourceEpoch != source.deleteEpoch) {
+                retireGuideState(key, state, source.deleteEpoch, now)
+                state = requireNotNull(state(key))
+            }
             require(state.nextGeneration in 1 until Long.MAX_VALUE) { "Guide generation space is exhausted" }
             state.latestGeneration?.let { supersedeGeneration(key, it, now) }
+            val stagedOnlyDelta = if (state.activeGeneration == null && state.latestGeneration == null) 1L else 0L
             generation = state.nextGeneration
             mutation = checkedIncrement(state.mutationEpoch)
             execute(
                 """
                 UPDATE guide_state
-                SET next_generation = ?, latest_generation = ?, mutation_epoch = ?
+                SET next_generation = ?, latest_generation = ?, mutation_epoch = ?,
+                    source_epoch = ?, deleted = 0
                 WHERE source_key = ? AND feed_id = ?
                 """.trimIndent(),
                 generation + 1,
                 generation,
                 mutation,
+                source.deleteEpoch,
                 key.sourceKey.value,
                 key.feedId.value,
             )
@@ -82,6 +102,8 @@ internal class SqlDelightDurableGuideStore(
                 retention.retainedFrom.toEpochMilliseconds(),
                 retention.retainedUntil.toEpochMilliseconds(),
             )
+            execute("UPDATE guide_source_state SET deleted = 0 WHERE source_key = ?", key.sourceKey.value)
+            adjustSourceCounts(key.sourceKey, stagedOnlyDelta = stagedOnlyDelta)
             bumpSource(key.sourceKey)
         }
         SqlGuideGeneration(owner, key, generation, mutation)
@@ -94,7 +116,8 @@ internal class SqlDelightDurableGuideStore(
         val current = state(token.key) ?: return@write false
         if (
             row.status != STATUS_STAGING || row.writerEpoch != token.mutationEpoch ||
-            row.expiresAtMillis <= now || current.latestGeneration != token.generation
+            row.expiresAtMillis <= now || current.latestGeneration != token.generation ||
+            !isCurrentSourceEpoch(token.key, current)
         ) return@write false
         execute(
             """
@@ -115,6 +138,9 @@ internal class SqlDelightDurableGuideStore(
         database.transaction {
             val row = generation(token.key, token.generation) ?: return@transaction
             if (row.status != STATUS_STAGING && row.status != STATUS_FAILED) return@transaction
+            val state = state(token.key) ?: return@transaction
+            val stagedOnly = state.latestGeneration == token.generation && state.activeGeneration == null &&
+                isCurrentSourceEpoch(token.key, state)
             execute(
                 """
                 UPDATE guide_generation SET status = 'abandoned'
@@ -126,6 +152,7 @@ internal class SqlDelightDurableGuideStore(
             )
             enqueueCleanup(token.key, token.generation, nowMillis())
             clearLatest(token.key, token.generation)
+            if (stagedOnly) adjustSourceCounts(token.key.sourceKey, stagedOnlyDelta = -1)
             bumpGuide(token.key)
             bumpSource(token.key.sourceKey)
             changed = true
@@ -153,7 +180,7 @@ internal class SqlDelightDurableGuideStore(
             val now = nowMillis()
             if (
                 row.writerEpoch != token.mutationEpoch || row.expiresAtMillis <= now ||
-                current.latestGeneration != token.generation
+                current.latestGeneration != token.generation || !isCurrentSourceEpoch(token.key, current)
             ) throw DurableGuideStoreException.Stale()
 
             val batches = checkedIncrement(row.attemptedBatches)
@@ -277,7 +304,8 @@ internal class SqlDelightDurableGuideStore(
             val current = state(token.key)
             if (
                 row == null || current == null || row.status != STATUS_STAGING ||
-                current.latestGeneration != token.generation || row.writerEpoch != token.mutationEpoch
+                current.latestGeneration != token.generation || row.writerEpoch != token.mutationEpoch ||
+                !isCurrentSourceEpoch(token.key, current)
             ) {
                 result = DurableGuideActivation.Superseded(activeSnapshot(token.key))
                 return@transaction
@@ -313,6 +341,11 @@ internal class SqlDelightDurableGuideStore(
                 token.key.sourceKey.value,
                 token.key.feedId.value,
             )
+            adjustSourceCounts(
+                token.key.sourceKey,
+                activeDelta = if (current.activeGeneration == null) 1 else 0,
+                stagedOnlyDelta = if (current.activeGeneration == null) -1 else 0,
+            )
             bumpSource(token.key.sourceKey)
             result = DurableGuideActivation.Published(
                 snapshot(token.key, token.generation, revision, current.mutationEpoch, row),
@@ -322,7 +355,9 @@ internal class SqlDelightDurableGuideStore(
     }
 
     override suspend fun snapshot(key: DurableGuideKey): DurableGuideSnapshot? = read {
-        activeSnapshot(key)
+        var result: DurableGuideSnapshot? = null
+        database.transaction { result = activeSnapshot(key) }
+        result
     }
 
     override suspend fun snapshots(
@@ -336,77 +371,95 @@ internal class SqlDelightDurableGuideStore(
         if (token.owner !== owner || token.sourceKey != source.sourceKey) {
             throw DurableGuideStoreException.Stale()
         }
-        if (sourceMutation(source.sourceKey) != token.mutationEpoch) {
-            throw DurableGuideStoreException.Stale()
+        var result: DurableGuideSnapshotPage? = null
+        database.transaction {
+            val currentSource = sourceState(source.sourceKey)
+            if (currentSource?.mutationEpoch != token.mutationEpoch) {
+                throw DurableGuideStoreException.Stale()
+            }
+            readProbe.afterSourceTokenValidated()
+            val domain = SourceCursorDomain(source.sourceKey, token.mutationEpoch)
+            val continuation = cursor(after, domain)
+            val rows = query(
+                """
+                SELECT s.feed_id, s.active_generation, s.revision, s.mutation_epoch,
+                       g.writer_epoch, g.retention_anchor_ms, g.retained_from_ms,
+                       g.retained_until_ms, g.channel_count, g.programme_count
+                FROM guide_state s
+                JOIN guide_source_state src ON src.source_key = s.source_key
+                JOIN guide_generation g
+                  ON g.source_key = s.source_key AND g.feed_id = s.feed_id
+                 AND g.generation = s.active_generation
+                WHERE s.source_key = ? AND src.deleted = 0
+                  AND s.source_epoch = src.delete_epoch AND s.deleted = 0 AND s.feed_id > ?
+                ORDER BY s.feed_id
+                LIMIT ?
+                """.trimIndent(),
+                source.sourceKey.value,
+                continuation?.text ?: "",
+                (limit + 1).toLong(),
+            ) { row -> snapshotFromSourceRow(source.sourceKey, row) }
+            val page = rows.take(limit)
+            result = DurableGuideSnapshotPage(
+                page,
+                page.lastOrNull()?.key?.feedId?.value
+                    ?.takeIf { rows.size > limit }
+                    ?.let { SqlGuideCursor(owner, domain, it, null) },
+            )
         }
-        val domain = SourceCursorDomain(source.sourceKey, token.mutationEpoch)
-        val cursor = cursor(after, domain)
-        val rows = query(
-            """
-            SELECT s.feed_id, s.active_generation, s.revision, s.mutation_epoch,
-                   g.writer_epoch, g.retention_anchor_ms, g.retained_from_ms,
-                   g.retained_until_ms, g.channel_count, g.programme_count
-            FROM guide_state s
-            JOIN guide_generation g
-              ON g.source_key = s.source_key AND g.feed_id = s.feed_id
-             AND g.generation = s.active_generation
-            WHERE s.source_key = ? AND s.deleted = 0 AND s.feed_id > ?
-            ORDER BY s.feed_id
-            LIMIT ?
-            """.trimIndent(),
-            source.sourceKey.value,
-            cursor?.text ?: "",
-            (limit + 1).toLong(),
-        ) { row -> snapshotFromSourceRow(source.sourceKey, row) }
-        val page = rows.take(limit)
-        DurableGuideSnapshotPage(
-            page,
-            page.lastOrNull()?.key?.feedId?.value
-                ?.takeIf { rows.size > limit }
-                ?.let { SqlGuideCursor(owner, domain, it, null) },
-        )
+        checkNotNull(result)
     }
 
     override suspend fun acquire(snapshot: DurableGuideSnapshot): DurableGuideSnapshotLease? = write {
         val token = snapshot as? SqlGuideSnapshot ?: return@write null
         if (token.owner !== owner) return@write null
         val now = nowMillis()
-        execute("DELETE FROM guide_lease WHERE expires_at_ms <= ?", now)
-        val exists = queryLong(
-            """
-            SELECT EXISTS(
-              SELECT 1 FROM guide_generation
-              WHERE source_key = ? AND feed_id = ? AND generation = ? AND cleanup_started = 0
+        var result: SqlGuideLease? = null
+        database.transaction {
+            // The bounded DELETE takes SQLite's writer reservation before the
+            // global count, making count-and-insert atomic across store owners.
+            execute(
+                """
+                DELETE FROM guide_lease WHERE lease_id IN (
+                  SELECT lease_id FROM guide_lease
+                  WHERE expires_at_ms <= ? ORDER BY expires_at_ms, lease_id LIMIT 1
+                )
+                """.trimIndent(),
+                now,
             )
-            """.trimIndent(),
-            token.key.sourceKey.value,
-            token.key.feedId.value,
-            token.generation,
-        ) == 1L
-        if (!exists) return@write null
-        val live = queryLong(
-            "SELECT COUNT(*) FROM guide_lease WHERE owner_id = ? AND expires_at_ms > ?",
-            ownerId,
-            now,
-        )
-        if (live >= DurableGuideLimits.MAX_LIVE_LEASES) throw DurableGuideStoreException.Limit()
-        execute(
-            """
-            INSERT INTO guide_lease(owner_id, source_key, feed_id, generation, revision, expires_at_ms)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """.trimIndent(),
-            ownerId,
-            token.key.sourceKey.value,
-            token.key.feedId.value,
-            token.generation,
-            token.revision,
-            checkedAdd(now, leaseIdleTimeoutMillis),
-        )
-        val leaseId = queryLong(
-            "SELECT lease_id FROM guide_lease WHERE owner_id = ? ORDER BY lease_id DESC LIMIT 1",
-            ownerId,
-        )
-        SqlGuideLease(owner, leaseId, token.key, token.generation, token.revision)
+            val exists = queryLong(
+                """
+                SELECT EXISTS(
+                  SELECT 1 FROM guide_generation
+                  WHERE source_key = ? AND feed_id = ? AND generation = ? AND cleanup_started = 0
+                )
+                """.trimIndent(),
+                token.key.sourceKey.value,
+                token.key.feedId.value,
+                token.generation,
+            ) == 1L
+            if (!exists) return@transaction
+            val live = queryLong("SELECT COUNT(*) FROM guide_lease WHERE expires_at_ms > ?", now)
+            if (live >= DurableGuideLimits.MAX_LIVE_LEASES) throw DurableGuideStoreException.Limit()
+            execute(
+                """
+                INSERT INTO guide_lease(owner_id, source_key, feed_id, generation, revision, expires_at_ms)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """.trimIndent(),
+                ownerId,
+                token.key.sourceKey.value,
+                token.key.feedId.value,
+                token.generation,
+                token.revision,
+                checkedAdd(now, leaseIdleTimeoutMillis),
+            )
+            val leaseId = queryLong(
+                "SELECT lease_id FROM guide_lease WHERE owner_id = ? ORDER BY lease_id DESC LIMIT 1",
+                ownerId,
+            )
+            result = SqlGuideLease(owner, leaseId, token.key, token.generation, token.revision)
+        }
+        result
     }
 
     override suspend fun renew(lease: DurableGuideSnapshotLease): Boolean = write {
@@ -801,6 +854,7 @@ internal class SqlDelightDurableGuideStore(
             ensureSourceAndGuide(key)
             val current = requireNotNull(state(key))
             val active = activeSnapshot(key)
+            val visible = isCurrentSourceEpoch(key, current)
             if (
                 expectedRevision != null &&
                 (current.revision != expectedRevision || current.mutationEpoch != expectedMutationEpoch)
@@ -824,6 +878,13 @@ internal class SqlDelightDurableGuideStore(
                 key.sourceKey.value,
                 key.feedId.value,
             )
+            if (visible) {
+                adjustSourceCounts(
+                    key.sourceKey,
+                    activeDelta = if (current.activeGeneration != null) -1 else 0,
+                    stagedOnlyDelta = if (current.activeGeneration == null && current.latestGeneration != null) -1 else 0,
+                )
+            }
             bumpSource(key.sourceKey)
             result = DurableGuideDeleteResult.Deleted(revision)
         }
@@ -831,14 +892,10 @@ internal class SqlDelightDurableGuideStore(
     }
 
     override suspend fun sourceSnapshot(sourceKey: DurableGuideSourceKey): DurableGuideSourceSnapshot = read {
-        DurableGuideSourceSnapshot(
-            sourceKey,
-            queryLong(
-                "SELECT COUNT(*) FROM guide_state WHERE source_key = ? AND deleted = 0 AND active_generation IS NOT NULL",
-                sourceKey.value,
-            ).coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-            SqlGuideSourceToken(owner, sourceKey, sourceMutation(sourceKey)),
-        )
+        val source = sourceState(sourceKey)
+        val mutation = source?.mutationEpoch ?: 0L
+        val count = if (source == null || source.deleted) 0 else source.activeFeedCount.toBoundedInt()
+        DurableGuideSourceSnapshot(sourceKey, count, SqlGuideSourceToken(owner, sourceKey, mutation))
     }
 
     override suspend fun deleteSource(
@@ -848,62 +905,43 @@ internal class SqlDelightDurableGuideStore(
         var result: DurableGuideSourceDeleteResult? = null
         database.transaction {
             ensureSource(sourceKey)
-            val activeCount = queryLong(
-                "SELECT COUNT(*) FROM guide_state WHERE source_key = ? AND deleted = 0 AND active_generation IS NOT NULL",
-                sourceKey.value,
-            ).toBoundedInt()
-            val stagedOnlyCount = queryLong(
-                """
-                SELECT COUNT(*) FROM guide_state
-                WHERE source_key = ? AND latest_generation IS NOT NULL AND active_generation IS NULL
-                """.trimIndent(),
-                sourceKey.value,
-            ).toBoundedInt()
+            val source = sourceState(sourceKey) ?: throw DurableGuideStoreException.Corrupt()
+            val activeCount = if (source.deleted) 0 else source.activeFeedCount.toBoundedInt()
+            val stagedOnlyCount = if (source.deleted) 0 else source.stagedOnlyFeedCount.toBoundedInt()
             if (expected != null) {
                 val token = expected as? SqlGuideSourceToken
                 if (
                     token == null || token.owner !== owner || token.sourceKey != sourceKey ||
-                    token.mutationEpoch != sourceMutation(sourceKey)
+                    token.mutationEpoch != source.mutationEpoch
                 ) {
                     result = DurableGuideSourceDeleteResult.Superseded(activeCount, stagedOnlyCount)
                     return@transaction
                 }
             }
             val now = nowMillis()
+            val deleteEpoch = checkedIncrement(source.deleteEpoch)
+            val mutation = checkedIncrement(source.mutationEpoch)
             execute(
                 """
-                INSERT OR IGNORE INTO guide_cleanup_queue(source_key, feed_id, generation, enqueued_at_ms)
-                SELECT source_key, feed_id, active_generation, ?
-                FROM guide_state
-                WHERE source_key = ? AND active_generation IS NOT NULL
-                """.trimIndent(),
-                now,
-                sourceKey.value,
-            )
-            execute(
-                """
-                INSERT OR IGNORE INTO guide_cleanup_queue(source_key, feed_id, generation, enqueued_at_ms)
-                SELECT source_key, feed_id, latest_generation, ?
-                FROM guide_state
-                WHERE source_key = ? AND latest_generation IS NOT NULL
-                """.trimIndent(),
-                now,
-                sourceKey.value,
-            )
-            execute(
-                "UPDATE guide_generation SET status = 'abandoned' WHERE source_key = ? AND status = 'staging'",
-                sourceKey.value,
-            )
-            execute(
-                """
-                UPDATE guide_state
-                SET active_generation = NULL, latest_generation = NULL, revision = revision + 1,
-                    mutation_epoch = mutation_epoch + 1, deleted = 1
+                UPDATE guide_source_state
+                SET mutation_epoch = ?, delete_epoch = ?, active_feed_count = 0,
+                    staged_only_feed_count = 0, deleted = 1
                 WHERE source_key = ?
                 """.trimIndent(),
+                mutation,
+                deleteEpoch,
                 sourceKey.value,
             )
-            bumpSource(sourceKey)
+            execute(
+                """
+                INSERT OR REPLACE INTO guide_source_cleanup(
+                  source_key, delete_epoch, after_feed_id, enqueued_at_ms
+                ) VALUES (?, ?, '', ?)
+                """.trimIndent(),
+                sourceKey.value,
+                deleteEpoch,
+                now,
+            )
             result = DurableGuideSourceDeleteResult.Deleted(activeCount, stagedOnlyCount)
         }
         checkNotNull(result)
@@ -913,85 +951,27 @@ internal class SqlDelightDurableGuideStore(
         if (maxRows !in 1..DurableGuideLimits.MAX_CLEANUP_ROWS) throw DurableGuideStoreException.Limit()
         var removed = 0L
         var hasMore = false
+        var expiredLeases = 0
+        var retiredSourceFeeds = 0
+        var expiredWriters = 0
         database.transaction {
             val now = nowMillis()
-            execute("DELETE FROM guide_lease WHERE expires_at_ms <= ?", now)
-            expireWriters(now)
-            val target = queryOne(
-                """
-                SELECT q.source_key, q.feed_id, q.generation
-                FROM guide_cleanup_queue q
-                JOIN guide_generation g
-                  ON g.source_key = q.source_key AND g.feed_id = q.feed_id AND g.generation = q.generation
-                WHERE NOT EXISTS (
-                  SELECT 1 FROM guide_lease l
-                  WHERE l.source_key = q.source_key AND l.feed_id = q.feed_id
-                    AND l.generation = q.generation AND l.expires_at_ms > ?
-                )
-                ORDER BY q.enqueued_at_ms, q.source_key, q.feed_id, q.generation
-                LIMIT 1
-                """.trimIndent(),
-                now,
-            ) { row -> CleanupTarget(requiredString(row, 0), requiredString(row, 1), requiredLong(row, 2)) }
-            if (target != null) {
-                execute(
-                    """
-                    UPDATE guide_generation SET cleanup_started = 1
-                    WHERE source_key = ? AND feed_id = ? AND generation = ?
-                    """.trimIndent(),
-                    target.sourceKey,
-                    target.feedId,
-                    target.generation,
-                )
-                val before = payloadRowCount(target)
-                execute(
-                    """
-                    DELETE FROM guide_channel WHERE rowid IN (
-                      SELECT rowid FROM guide_channel
-                      WHERE source_key = ? AND feed_id = ? AND generation = ? LIMIT ?
-                    )
-                    """.trimIndent(),
-                    target.sourceKey,
-                    target.feedId,
-                    target.generation,
-                    maxRows.toLong(),
-                )
-                val afterChannels = payloadRowCount(target)
-                val channelRemoved = before - afterChannels
-                val remaining = maxRows.toLong() - channelRemoved
-                if (remaining > 0) {
-                    execute(
-                        """
-                        DELETE FROM guide_programme WHERE rowid IN (
-                          SELECT rowid FROM guide_programme
-                          WHERE source_key = ? AND feed_id = ? AND generation = ? LIMIT ?
-                        )
-                        """.trimIndent(),
-                        target.sourceKey,
-                        target.feedId,
-                        target.generation,
-                        remaining,
-                    )
-                }
-                val after = payloadRowCount(target)
-                removed = before - after
-                if (after == 0L) {
-                    execute(
-                        "DELETE FROM guide_generation WHERE source_key = ? AND feed_id = ? AND generation = ?",
-                        target.sourceKey,
-                        target.feedId,
-                        target.generation,
-                    )
-                    execute(
-                        "DELETE FROM guide_cleanup_queue WHERE source_key = ? AND feed_id = ? AND generation = ?",
-                        target.sourceKey,
-                        target.feedId,
-                        target.generation,
-                    )
-                }
+            expiredLeases = reapExpiredLeases(now, maxRows)
+            if (expiredLeases == 0) {
+                retiredSourceFeeds = if (retireOneSourceFeed(now)) 1 else 0
+            }
+            if (expiredLeases == 0 && retiredSourceFeeds == 0) {
+                expiredWriters = if (expireOneWriter(now)) 1 else 0
+                removed = cleanupOneGeneration(now, maxRows)
             }
             hasMore = cleanupEligible(now)
         }
+        lastCleanupWorkForTest = GuideCleanupWork(
+            expiredLeases = expiredLeases,
+            retiredSourceFeeds = retiredSourceFeeds,
+            expiredWriters = expiredWriters,
+            removedPayloadRows = removed.toBoundedInt(),
+        )
         DurableGuideCleanupResult(removed.toBoundedInt(), hasMore)
     }
 
@@ -1021,15 +1001,40 @@ internal class SqlDelightDurableGuideStore(
                 """.trimIndent(),
                 "source", "feed", 1L, 1L,
             ),
+            explain(
+                """
+                EXPLAIN QUERY PLAN SELECT lease_id FROM guide_lease
+                WHERE expires_at_ms <= ? ORDER BY expires_at_ms, lease_id LIMIT ?
+                """.trimIndent(),
+                1L, 1L,
+            ),
+            explain(
+                """
+                EXPLAIN QUERY PLAN SELECT source_key, feed_id, generation FROM guide_generation
+                WHERE status = 'staging' AND expires_at_ms <= ?
+                ORDER BY expires_at_ms, source_key, feed_id, generation LIMIT 1
+                """.trimIndent(),
+                1L,
+            ),
+            explain(
+                """
+                EXPLAIN QUERY PLAN SELECT feed_id FROM guide_state
+                WHERE source_key = ? AND source_epoch < ? AND feed_id > ?
+                ORDER BY feed_id LIMIT 1
+                """.trimIndent(),
+                "source", 1L, "",
+            ),
         ).flatten()
     }
 
     private fun ensureSourceAndGuide(key: DurableGuideKey) {
         ensureSource(key.sourceKey)
+        val source = requireNotNull(sourceState(key.sourceKey))
         execute(
-            "INSERT OR IGNORE INTO guide_state(source_key, feed_id) VALUES (?, ?)",
+            "INSERT OR IGNORE INTO guide_state(source_key, feed_id, source_epoch) VALUES (?, ?, ?)",
             key.sourceKey.value,
             key.feedId.value,
+            source.deleteEpoch,
         )
     }
 
@@ -1037,9 +1042,26 @@ internal class SqlDelightDurableGuideStore(
         execute("INSERT OR IGNORE INTO guide_source_state(source_key) VALUES (?)", sourceKey.value)
     }
 
+    private fun sourceState(sourceKey: DurableGuideSourceKey): GuideSourceStateRow? = queryOne(
+        """
+        SELECT mutation_epoch, delete_epoch, active_feed_count, staged_only_feed_count, deleted
+        FROM guide_source_state WHERE source_key = ?
+        """.trimIndent(),
+        sourceKey.value,
+    ) { row ->
+        GuideSourceStateRow(
+            mutationEpoch = requiredLong(row, 0),
+            deleteEpoch = requiredLong(row, 1),
+            activeFeedCount = requiredLong(row, 2),
+            stagedOnlyFeedCount = requiredLong(row, 3),
+            deleted = requiredLong(row, 4) != 0L,
+        )
+    }
+
     private fun state(key: DurableGuideKey): GuideStateRow? = queryOne(
         """
-        SELECT active_generation, latest_generation, next_generation, revision, mutation_epoch, deleted
+        SELECT active_generation, latest_generation, next_generation, revision, mutation_epoch,
+               source_epoch, deleted
         FROM guide_state WHERE source_key = ? AND feed_id = ?
         """.trimIndent(),
         key.sourceKey.value,
@@ -1051,7 +1073,8 @@ internal class SqlDelightDurableGuideStore(
             requiredLong(row, 2),
             requiredLong(row, 3),
             requiredLong(row, 4),
-            requiredLong(row, 5) != 0L,
+            requiredLong(row, 5),
+            requiredLong(row, 6) != 0L,
         )
     }
 
@@ -1089,10 +1112,16 @@ internal class SqlDelightDurableGuideStore(
 
     private fun activeSnapshot(key: DurableGuideKey): SqlGuideSnapshot? {
         val state = state(key) ?: return null
-        if (state.deleted) return null
+        val source = sourceState(key.sourceKey) ?: return null
+        if (source.deleted || state.sourceEpoch != source.deleteEpoch || state.deleted) return null
         val generation = state.activeGeneration ?: return null
         val row = generation(key, generation) ?: throw DurableGuideStoreException.Corrupt()
         return snapshot(key, generation, state.revision, state.mutationEpoch, row)
+    }
+
+    private fun isCurrentSourceEpoch(key: DurableGuideKey, state: GuideStateRow): Boolean {
+        val source = sourceState(key.sourceKey) ?: return false
+        return !source.deleted && state.sourceEpoch == source.deleteEpoch
     }
 
     private fun snapshot(
@@ -1350,6 +1379,9 @@ internal class SqlDelightDurableGuideStore(
     }
 
     private fun failGeneration(key: DurableGuideKey, generation: Long, now: Long) {
+        val current = state(key)
+        val stagedOnly = current?.latestGeneration == generation && current.activeGeneration == null &&
+            isCurrentSourceEpoch(key, current)
         execute(
             """
             UPDATE guide_generation SET status = 'failed'
@@ -1360,6 +1392,7 @@ internal class SqlDelightDurableGuideStore(
             generation,
         )
         clearLatest(key, generation)
+        if (stagedOnly) adjustSourceCounts(key.sourceKey, stagedOnlyDelta = -1)
         enqueueCleanup(key, generation, now)
     }
 
@@ -1412,29 +1445,226 @@ internal class SqlDelightDurableGuideStore(
         )
     }
 
-    private fun expireWriters(now: Long) {
+    private fun reapExpiredLeases(now: Long, limit: Int): Int {
         execute(
             """
-            INSERT OR IGNORE INTO guide_cleanup_queue(source_key, feed_id, generation, enqueued_at_ms)
-            SELECT source_key, feed_id, generation, ? FROM guide_generation
-            WHERE status = 'staging' AND expires_at_ms <= ?
-            """.trimIndent(),
-            now,
-            now,
-        )
-        execute(
-            """
-            UPDATE guide_state SET latest_generation = NULL
-            WHERE latest_generation IS NOT NULL AND EXISTS (
-              SELECT 1 FROM guide_generation g
-              WHERE g.source_key = guide_state.source_key AND g.feed_id = guide_state.feed_id
-                AND g.generation = guide_state.latest_generation
-                AND g.status = 'staging' AND g.expires_at_ms <= ?
+            DELETE FROM guide_lease WHERE lease_id IN (
+              SELECT lease_id FROM guide_lease
+              WHERE expires_at_ms <= ? ORDER BY expires_at_ms, lease_id LIMIT ?
             )
             """.trimIndent(),
             now,
+            limit.toLong(),
         )
-        execute("UPDATE guide_generation SET status = 'failed' WHERE status = 'staging' AND expires_at_ms <= ?", now)
+        return changedRows().toBoundedInt()
+    }
+
+    private fun retireOneSourceFeed(now: Long): Boolean {
+        val job = queryOne(
+            """
+            SELECT source_key, delete_epoch, after_feed_id
+            FROM guide_source_cleanup
+            ORDER BY enqueued_at_ms, source_key
+            LIMIT 1
+            """.trimIndent(),
+        ) { row -> SourceCleanupJob(requiredString(row, 0), requiredLong(row, 1), requiredString(row, 2)) }
+            ?: return false
+        val row = queryOne(
+            """
+            SELECT feed_id, active_generation, latest_generation, next_generation,
+                   revision, mutation_epoch, source_epoch, deleted
+            FROM guide_state
+            WHERE source_key = ? AND source_epoch < ? AND feed_id > ?
+            ORDER BY feed_id
+            LIMIT 1
+            """.trimIndent(),
+            job.sourceKey,
+            job.deleteEpoch,
+            job.afterFeedId,
+        ) { cursor ->
+            val key = DurableGuideKey(
+                DurableGuideSourceKey(job.sourceKey),
+                DurableGuideFeedId(requiredString(cursor, 0)),
+            )
+            key to GuideStateRow(
+                activeGeneration = cursor.getLong(1),
+                latestGeneration = cursor.getLong(2),
+                nextGeneration = requiredLong(cursor, 3),
+                revision = requiredLong(cursor, 4),
+                mutationEpoch = requiredLong(cursor, 5),
+                sourceEpoch = requiredLong(cursor, 6),
+                deleted = requiredLong(cursor, 7) != 0L,
+            )
+        }
+        if (row == null) {
+            execute("DELETE FROM guide_source_cleanup WHERE source_key = ?", job.sourceKey)
+            return true
+        }
+        retireGuideState(row.first, row.second, job.deleteEpoch, now)
+        execute(
+            "UPDATE guide_source_cleanup SET after_feed_id = ? WHERE source_key = ? AND delete_epoch = ?",
+            row.first.feedId.value,
+            job.sourceKey,
+            job.deleteEpoch,
+        )
+        return true
+    }
+
+    private fun retireGuideState(
+        key: DurableGuideKey,
+        state: GuideStateRow,
+        sourceEpoch: Long,
+        now: Long,
+    ) {
+        state.activeGeneration?.let { enqueueCleanup(key, it, now) }
+        state.latestGeneration?.let { generation ->
+            execute(
+                """
+                UPDATE guide_generation SET status = 'abandoned'
+                WHERE source_key = ? AND feed_id = ? AND generation = ? AND status = 'staging'
+                """.trimIndent(),
+                key.sourceKey.value,
+                key.feedId.value,
+                generation,
+            )
+            enqueueCleanup(key, generation, now)
+        }
+        execute(
+            """
+            UPDATE guide_state
+            SET active_generation = NULL, latest_generation = NULL,
+                revision = revision + 1, mutation_epoch = mutation_epoch + 1,
+                source_epoch = ?, deleted = 1
+            WHERE source_key = ? AND feed_id = ? AND source_epoch < ?
+            """.trimIndent(),
+            sourceEpoch,
+            key.sourceKey.value,
+            key.feedId.value,
+            sourceEpoch,
+        )
+    }
+
+    private fun expireOneWriter(now: Long): Boolean {
+        val target = queryOne(
+            """
+            SELECT source_key, feed_id, generation
+            FROM guide_generation
+            WHERE status = 'staging' AND expires_at_ms <= ?
+            ORDER BY expires_at_ms, source_key, feed_id, generation
+            LIMIT 1
+            """.trimIndent(),
+            now,
+        ) { row -> CleanupTarget(requiredString(row, 0), requiredString(row, 1), requiredLong(row, 2)) }
+            ?: return false
+        val key = DurableGuideKey(
+            DurableGuideSourceKey(target.sourceKey),
+            DurableGuideFeedId(target.feedId),
+        )
+        val state = state(key)
+        val stagedOnly = state?.latestGeneration == target.generation && state.activeGeneration == null &&
+            isCurrentSourceEpoch(key, state)
+        execute(
+            """
+            UPDATE guide_generation SET status = 'failed'
+            WHERE source_key = ? AND feed_id = ? AND generation = ? AND status = 'staging'
+            """.trimIndent(),
+            target.sourceKey,
+            target.feedId,
+            target.generation,
+        )
+        clearLatest(key, target.generation)
+        if (stagedOnly) adjustSourceCounts(key.sourceKey, stagedOnlyDelta = -1)
+        enqueueCleanup(key, target.generation, now)
+        return true
+    }
+
+    private fun cleanupOneGeneration(now: Long, maxRows: Int): Long {
+        val target = queryOne(
+            """
+            SELECT q.source_key, q.feed_id, q.generation
+            FROM guide_cleanup_queue q
+            JOIN guide_generation g
+              ON g.source_key = q.source_key AND g.feed_id = q.feed_id AND g.generation = q.generation
+            WHERE NOT EXISTS (
+              SELECT 1 FROM guide_lease l
+              WHERE l.source_key = q.source_key AND l.feed_id = q.feed_id
+                AND l.generation = q.generation AND l.expires_at_ms > ?
+            )
+            ORDER BY q.enqueued_at_ms, q.source_key, q.feed_id, q.generation
+            LIMIT 1
+            """.trimIndent(),
+            now,
+        ) { row -> CleanupTarget(requiredString(row, 0), requiredString(row, 1), requiredLong(row, 2)) }
+            ?: return 0L
+        execute(
+            """
+            UPDATE guide_generation SET cleanup_started = 1
+            WHERE source_key = ? AND feed_id = ? AND generation = ?
+            """.trimIndent(),
+            target.sourceKey,
+            target.feedId,
+            target.generation,
+        )
+        execute(
+            """
+            DELETE FROM guide_channel WHERE rowid IN (
+              SELECT rowid FROM guide_channel
+              WHERE source_key = ? AND feed_id = ? AND generation = ? LIMIT ?
+            )
+            """.trimIndent(),
+            target.sourceKey,
+            target.feedId,
+            target.generation,
+            maxRows.toLong(),
+        )
+        val channelRows = changedRows()
+        val remaining = maxRows.toLong() - channelRows
+        var programmeRows = 0L
+        if (remaining > 0) {
+            execute(
+                """
+                DELETE FROM guide_programme WHERE rowid IN (
+                  SELECT rowid FROM guide_programme
+                  WHERE source_key = ? AND feed_id = ? AND generation = ? LIMIT ?
+                )
+                """.trimIndent(),
+                target.sourceKey,
+                target.feedId,
+                target.generation,
+                remaining,
+            )
+            programmeRows = changedRows()
+        }
+        val hasPayload = queryLong(
+            """
+            SELECT EXISTS(
+              SELECT 1 FROM guide_channel WHERE source_key = ? AND feed_id = ? AND generation = ?
+              UNION ALL
+              SELECT 1 FROM guide_programme WHERE source_key = ? AND feed_id = ? AND generation = ?
+            )
+            """.trimIndent(),
+            target.sourceKey,
+            target.feedId,
+            target.generation,
+            target.sourceKey,
+            target.feedId,
+            target.generation,
+        ) == 1L
+        if (!hasPayload) {
+            execute(
+                "DELETE FROM guide_generation WHERE source_key = ? AND feed_id = ? AND generation = ?",
+                target.sourceKey,
+                target.feedId,
+                target.generation,
+            )
+            execute(
+                "DELETE FROM guide_cleanup_queue WHERE source_key = ? AND feed_id = ? AND generation = ?",
+                target.sourceKey,
+                target.feedId,
+                target.generation,
+            )
+        }
+        return channelRows + programmeRows
     }
 
     private fun bumpGuide(key: DurableGuideKey) {
@@ -1458,23 +1688,36 @@ internal class SqlDelightDurableGuideStore(
         sourceKey.value,
     ) ?: 0L
 
-    private fun payloadRowCount(target: CleanupTarget): Long = queryLong(
-        """
-        SELECT
-          (SELECT COUNT(*) FROM guide_channel WHERE source_key = ? AND feed_id = ? AND generation = ?) +
-          (SELECT COUNT(*) FROM guide_programme WHERE source_key = ? AND feed_id = ? AND generation = ?)
-        """.trimIndent(),
-        target.sourceKey,
-        target.feedId,
-        target.generation,
-        target.sourceKey,
-        target.feedId,
-        target.generation,
-    )
+    private fun adjustSourceCounts(
+        sourceKey: DurableGuideSourceKey,
+        activeDelta: Long = 0,
+        stagedOnlyDelta: Long = 0,
+    ) {
+        if (activeDelta == 0L && stagedOnlyDelta == 0L) return
+        execute(
+            """
+            UPDATE guide_source_state
+            SET active_feed_count = active_feed_count + ?,
+                staged_only_feed_count = staged_only_feed_count + ?
+            WHERE source_key = ?
+            """.trimIndent(),
+            activeDelta,
+            stagedOnlyDelta,
+            sourceKey.value,
+        )
+        val source = sourceState(sourceKey) ?: throw DurableGuideStoreException.Corrupt()
+        if (source.activeFeedCount < 0 || source.stagedOnlyFeedCount < 0) {
+            throw DurableGuideStoreException.Corrupt()
+        }
+    }
 
     private fun cleanupEligible(now: Long): Boolean = queryLong(
         """
         SELECT EXISTS(
+          SELECT 1 FROM guide_lease WHERE expires_at_ms <= ?
+          UNION ALL SELECT 1 FROM guide_source_cleanup
+          UNION ALL SELECT 1 FROM guide_generation WHERE status = 'staging' AND expires_at_ms <= ?
+          UNION ALL
           SELECT 1 FROM guide_cleanup_queue q
           JOIN guide_generation g
             ON g.source_key = q.source_key AND g.feed_id = q.feed_id AND g.generation = q.generation
@@ -1486,7 +1729,11 @@ internal class SqlDelightDurableGuideStore(
         )
         """.trimIndent(),
         now,
+        now,
+        now,
     ) == 1L
+
+    private fun changedRows(): Long = queryLong("SELECT changes()")
 
     private fun execute(sql: String, vararg arguments: Any?): Long = driver.execute(
         identifier = null,
@@ -1594,8 +1841,27 @@ private data class GuideStateRow(
     val nextGeneration: Long,
     val revision: Long,
     val mutationEpoch: Long,
+    val sourceEpoch: Long,
     val deleted: Boolean,
 )
+
+private data class GuideSourceStateRow(
+    val mutationEpoch: Long,
+    val deleteEpoch: Long,
+    val activeFeedCount: Long,
+    val stagedOnlyFeedCount: Long,
+    val deleted: Boolean,
+)
+
+internal data class GuideCleanupWork(
+    val expiredLeases: Int = 0,
+    val retiredSourceFeeds: Int = 0,
+    val expiredWriters: Int = 0,
+    val removedPayloadRows: Int = 0,
+) {
+    val total: Int
+        get() = expiredLeases + retiredSourceFeeds + expiredWriters + removedPayloadRows
+}
 
 private data class GenerationRow(
     val status: String,
@@ -1631,6 +1897,12 @@ private data class CleanupTarget(
     val sourceKey: String,
     val feedId: String,
     val generation: Long,
+)
+
+private data class SourceCleanupJob(
+    val sourceKey: String,
+    val deleteEpoch: Long,
+    val afterFeedId: String,
 )
 
 private data class LeaseRow(
