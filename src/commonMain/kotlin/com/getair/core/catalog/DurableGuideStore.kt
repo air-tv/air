@@ -704,7 +704,7 @@ private fun StringBuilder.appendCanonicalField(value: String?) {
 
 private fun String?.encodedFieldBytes(): Int = 16 + (this?.encodeToByteArray()?.size ?: 0)
 
-private fun sha256Hex(input: ByteArray): String {
+internal fun sha256Hex(input: ByteArray): String {
     val padding = (64 + 56 - ((input.size + 1) % 64)) % 64
     val message = ByteArray(input.size + 1 + padding + 8)
     input.copyInto(message)
