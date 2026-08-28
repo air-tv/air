@@ -85,4 +85,23 @@ class PersistentStateTest {
         assertFalse(secret in error.toString())
         assertEquals(null, error.cause)
     }
+
+    @Test
+    fun browserDocumentBehaviorNamespacesAndBoundsNonSecretState() = runTest {
+        val values = mutableMapOf<String, String>()
+        val store = BrowserDocumentStore(
+            namespace = "air-test",
+            readValue = values::get,
+            writeValue = values::set,
+            removeValue = values::remove,
+            maximumDocumentChars = 8,
+        )
+
+        store.write("profile.v1", "state")
+        assertEquals("state", values["air-test:profile.v1"])
+        assertEquals("state", store.read("profile.v1"))
+        assertFailsWith<IllegalArgumentException> { store.write("large.v1", "123456789") }
+        store.remove("profile.v1")
+        assertEquals(null, store.read("profile.v1"))
+    }
 }

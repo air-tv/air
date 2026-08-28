@@ -13,7 +13,6 @@ import platform.Foundation.NSUTF8StringEncoding
 import platform.Foundation.create
 import platform.Foundation.dataUsingEncoding
 import platform.Foundation.dataWithContentsOfFile
-import platform.Foundation.defaultManager
 import platform.Foundation.length
 import platform.Foundation.writeToFile
 
@@ -83,6 +82,6 @@ class AppleFileDocumentStore(
     override fun toString(): String = "AppleFileDocumentStore(directory=<redacted>)"
 
     private companion object {
-        const val DEFAULT_MAXIMUM_DOCUMENT_BYTES: ULong = 16uL * 1024uL * 1024uL
+        const val DEFAULT_MAXIMUM_DOCUMENT_BYTES: ULong = 16_777_216uL
     }
 }

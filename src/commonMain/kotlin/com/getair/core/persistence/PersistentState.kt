@@ -48,6 +48,44 @@ class InMemoryDocumentStore : LocalDocumentStore {
     override fun toString(): String = "InMemoryDocumentStore(values=<redacted>)"
 }
 
+/** Shared bounded behavior behind the JS and Wasm localStorage factories. */
+internal class BrowserDocumentStore(
+    namespace: String,
+    private val readValue: (String) -> String?,
+    private val writeValue: (String, String) -> Unit,
+    private val removeValue: (String) -> Unit,
+    private val maximumDocumentChars: Int = 4 * 1024 * 1024,
+) : LocalDocumentStore {
+    private val mutex = Mutex()
+    private val namespace = namespace.also(::validateLocalDocumentName)
+
+    init {
+        require(maximumDocumentChars > 0)
+    }
+
+    override suspend fun read(document: String): String? = mutex.withLock {
+        validateLocalDocumentName(document)
+        readValue(key(document))?.also {
+            require(it.length <= maximumDocumentChars) { "Local application document is too large" }
+        }
+    }
+
+    override suspend fun write(document: String, value: String) {
+        validateLocalDocumentName(document)
+        require(value.length <= maximumDocumentChars) { "Local application document is too large" }
+        mutex.withLock { writeValue(key(document), value) }
+    }
+
+    override suspend fun remove(document: String) {
+        validateLocalDocumentName(document)
+        mutex.withLock { removeValue(key(document)) }
+    }
+
+    private fun key(document: String): String = "$namespace:$document"
+
+    override fun toString(): String = "BrowserDocumentStore(namespace=<redacted>)"
+}
+
 class PersistentHouseholdStore private constructor(
     private val delegate: PersistentDocumentState<HouseholdState>,
 ) : LocalHouseholdStore {

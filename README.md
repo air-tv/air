@@ -40,10 +40,12 @@ bounded, and future history sync remains optional.
 Household/settings, non-secret source metadata, and Continue Watching can be
 opened as versioned persistent JSON documents through one `LocalDocumentStore`.
 `JvmFileDocumentStore`, `AndroidFileDocumentStore`, and
-`AppleFileDocumentStore` use atomic replacement; a failed durable write never
-updates the observable `StateFlow`. Android stores these documents under the
-app's no-backup directory. Provider credentials and configured URLs remain in
-the separate OS credential vault and never enter these documents.
+`AppleFileDocumentStore` use atomic replacement; JS/Wasm exposes
+`browserLocalDocumentStore` for non-secret localStorage documents. A failed
+durable write never updates the observable `StateFlow`. Android stores these
+documents under the app's no-backup directory. Provider credentials and
+configured URLs remain in the separate OS credential vault and never enter
+these documents or browser localStorage.
 
 ```bash
 ./gradlew jvmTest jsNodeTest wasmJsNodeTest

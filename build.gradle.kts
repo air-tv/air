@@ -42,6 +42,7 @@ kotlin {
             implementation(kotlin("test"))
             implementation(libs.kotlinx.coroutines.test)
         }
+        wasmJsMain.dependencies { implementation(libs.kotlinx.browser) }
     }
 }
 
