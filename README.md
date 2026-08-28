@@ -47,6 +47,12 @@ documents under the app's no-backup directory. Provider credentials and
 configured URLs remain in the separate OS credential vault and never enter
 these documents or browser localStorage.
 
+Shell setup is one suspend call: `openAndroidLocalApplicationState`,
+`openAppleLocalApplicationState`, `openLinuxLocalApplicationState`, or
+`openBrowserLocalApplicationState`. Each composes durable documents, the
+platform credential vault, and local-first repositories without a DI container.
+Browser source credentials are intentionally session-only.
+
 ```bash
 ./gradlew jvmTest jsNodeTest wasmJsNodeTest
 ```
