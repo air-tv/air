@@ -19,6 +19,12 @@ and rating choices plus device-level OLED, motion, density, refresh, decoder,
 timeout, response-limit and diagnostics settings. It is local by default and
 accepts a `HouseholdSyncSource` only when a future server exists.
 
+`LocalSourceRegistry` stores only non-secret source names/kinds/enabled state in
+ordinary local state. Exact `XtreamCredentials`/`StalkerCredentials`, M3U/XMLTV
+URLs and headers, and Stremio manifest URLs stay behind a required
+`LocalSourceSecretStore`. Only metadata has an optional future sync source;
+browser persistence and plaintext production vaults are not supplied.
+
 ```bash
 ./gradlew jvmTest jsNodeTest wasmJsNodeTest
 ```
