@@ -6,11 +6,26 @@ import kotlin.io.path.createTempDirectory
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class WindowsDpapiLocalSourceSecretStoreTest {
+    @Test
+    fun successfulReadCannotSilentlyReturnAnEmptyPayload() = runTest {
+        val runner = RecordingPowerShellRunner()
+        val directory = createTempDirectory("air-dpapi-empty-test-")
+        try {
+            val store = WindowsDpapiLocalSourceSecretStore(directory, runner)
+
+            assertFailsWith<IllegalStateException> { store.read(LocalSourceId("missing-output")) }
+            assertTrue("Write-Output" in runner.requests.single().script)
+        } finally {
+            directory.toFile().deleteRecursively()
+        }
+    }
+
     @Test
     fun credentialPayloadUsesStdinAndNeverArgvOrEnvironment() = runTest {
         val runner = RecordingPowerShellRunner()

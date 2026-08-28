@@ -39,7 +39,9 @@ class WindowsDpapiLocalSourceSecretStore private constructor(
         cache[id]?.let { return@withLock it.value }
         val result = runner.run(READ_SCRIPT, target(id), null)
         val value = when (result.exitCode) {
-            POWERSHELL_SUCCESS -> result.standardOutput.trim().ifEmpty { null }?.let { encoded ->
+            POWERSHELL_SUCCESS -> result.standardOutput.trim().ifEmpty {
+                throw IllegalStateException("Windows source credential output is empty")
+            }.let { encoded ->
                 val document = try {
                     Base64.getDecoder().decode(encoded).toString(StandardCharsets.UTF_8)
                 } catch (_: IllegalArgumentException) {
@@ -188,7 +190,7 @@ private val READ_SCRIPT = """
         ${'$'}null,
         [Security.Cryptography.DataProtectionScope]::CurrentUser
     )
-    [Console]::Out.Write([Convert]::ToBase64String(${'$'}plain))
+    Write-Output ([Convert]::ToBase64String(${'$'}plain))
 """.trimIndent()
 
 private val REMOVE_SCRIPT = """
