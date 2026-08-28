@@ -84,7 +84,7 @@ class BrowserDurableCatalogStoreTest {
         val inspection = inspectUpgradedDatabase(databaseName.toJsString()).await<JsString>().toString()
         assertContains(inspection, "\"version\":4")
         assertContains(inspection, "\"legacy\":true")
-        listOf("guideStates", "guideGenerations", "guideChannels", "guideProgrammes", "guideLeases", "guideCleanupQueue")
+        listOf("guideStates", "guideGenerations", "guideChannels", "guideProgrammes", "guideTimeline", "guideMigration", "guideLeases", "guideCleanupQueue")
             .forEach { store -> assertContains(inspection, "\"$store\"") }
     }
 
@@ -94,15 +94,21 @@ class BrowserDurableCatalogStoreTest {
         val databaseName = uniqueDatabase("v3-guide-upgrade")
         createLegacyV3GuideDatabase(databaseName.toJsString()).await<JsString>()
         openBrowserDurableCatalogStore(databaseName).close()
-        val inspection = inspectLegacyV3GuideUpgrade(databaseName.toJsString()).await<JsString>().toString()
-        assertContains(inspection, "\"version\":4")
-        assertContains(inspection, "\"legacy\":true")
-        assertContains(inspection, "\"maxFiniteSpanMs\":1000")
-        assertContains(inspection, "\"minStartMs\":500")
-        assertContains(inspection, "\"finiteStartMs\":500")
-        assertContains(inspection, "\"openStartMs\":800")
-        assertContains(inspection, "\"generationChannelFiniteStart\"")
-        assertContains(inspection, "\"generationChannelOpenStart\"")
+        val partial = inspectLegacyV3GuideUpgrade(databaseName.toJsString()).await<JsString>().toString()
+        assertContains(partial, "\"version\":4")
+        assertContains(partial, "\"legacy\":true")
+        assertContains(partial, "\"timelineCount\":512")
+        assertContains(partial, "\"complete\":false")
+        openBrowserDurableCatalogStore(databaseName).close()
+        val complete = inspectLegacyV3GuideUpgrade(databaseName.toJsString()).await<JsString>().toString()
+        assertContains(complete, "\"timelineCount\":602")
+        assertContains(complete, "\"complete\":true")
+        assertContains(complete, "\"maxFiniteSpanMs\":1000")
+        assertContains(complete, "\"minStartMs\":500")
+        assertContains(complete, "\"finiteStartMs\":500")
+        assertContains(complete, "\"openStartMs\":800")
+        assertContains(complete, "\"generationChannelFiniteStart\"")
+        assertContains(complete, "\"generationChannelOpenStart\"")
     }
 
     @Test
@@ -207,7 +213,7 @@ private external fun inspectUpgradedDatabase(databaseName: JsString): Promise<Js
       feedStateKey: 'legacy-feed', generation: 1, mutationEpoch: 1,
       retention: { anchorMs: 1000, retainedFromMs: 1000, retainedUntilMs: 10000 },
       channelPrefix: 'legacy-channel|', programmePrefix: 'legacy-programme|', status: 'active', expiresAt: 0,
-      batchCount: 1, inputChannelRows: 0, inputProgrammeRows: 2, channelCount: 0, programmeCount: 2,
+      batchCount: 3, inputChannelRows: 0, inputProgrammeRows: 602, channelCount: 0, programmeCount: 602,
       cleanupStarted: false
     });
     const store = transaction.objectStore('guideProgrammes');
@@ -221,6 +227,16 @@ private external fun inspectUpgradedDatabase(databaseName: JsString): Promise<Js
       winnerKey: 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
       startMs: 800, endMs: null, effectiveEndMs: 3093527980800000, title: 'open', subtitle: null,
       description: null, categories: [], episode: null, artworkReference: null });
+    for (let index = 0; index < 600; index += 1) {
+      const start = 2000 + index;
+      const suffix = String(index).padStart(4, '0');
+      store.put({ key: 'legacy-row-' + suffix, endKey: 'legacy-end-row-' + suffix,
+        generationKey: 'legacy-generation',
+        channelKey: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        winnerKey: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+        startMs: start, endMs: start + 1000, effectiveEndMs: start + 1000, title: 'row-' + suffix,
+        subtitle: null, description: null, categories: [], episode: null, artworkReference: null });
+    }
     transaction.oncomplete = () => { database.close(); resolve('ok'); };
     transaction.onerror = () => reject(transaction.error);
   };
@@ -232,16 +248,21 @@ private external fun createLegacyV3GuideDatabase(databaseName: JsString): Promis
   request.onerror = () => reject(request.error);
   request.onsuccess = () => {
     const database = request.result;
-    const transaction = database.transaction(['sources', 'guideGenerations', 'guideProgrammes'], 'readonly');
+    const transaction = database.transaction(['sources', 'guideGenerations', 'guideTimeline', 'guideMigration'], 'readonly');
     const legacy = transaction.objectStore('sources').get('legacy-source');
     const generation = transaction.objectStore('guideGenerations').get('legacy-generation');
-    const finite = transaction.objectStore('guideProgrammes').get('legacy-finite');
-    const open = transaction.objectStore('guideProgrammes').get('legacy-open');
+    const timeline = transaction.objectStore('guideTimeline');
+    const timelineCount = timeline.count();
+    const finite = timeline.get('legacy-finite');
+    const open = timeline.get('legacy-open');
+    const migration = transaction.objectStore('guideMigration').get('legacy-v3');
     transaction.oncomplete = () => {
       const result = JSON.stringify({ version: database.version, legacy: JSON.parse(legacy.result).legacy,
         maxFiniteSpanMs: generation.result.maxFiniteSpanMs, minStartMs: generation.result.minStartMs,
-        finiteStartMs: finite.result.finiteStartMs, openStartMs: open.result.openStartMs,
-        indexes: Array.from(database.transaction(['guideProgrammes'], 'readonly').objectStore('guideProgrammes').indexNames) });
+        timelineCount: timelineCount.result, complete: migration.result.complete,
+        finiteStartMs: finite.result && finite.result.finiteStartMs,
+        openStartMs: open.result && open.result.openStartMs,
+        indexes: Array.from(database.transaction(['guideTimeline'], 'readonly').objectStore('guideTimeline').indexNames) });
       database.close(); resolve(result);
     };
     transaction.onerror = () => reject(transaction.error);

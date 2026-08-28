@@ -75,10 +75,12 @@ private class IndexedDbDurableCatalogStore(
     private val writes = Mutex()
     private var nextOperation = 0L
     private var closed = false
-    override val guides: DurableGuideStore = IndexedDbDurableGuideStore(databaseName, executor, nowMillis)
+    private val guideStore = IndexedDbDurableGuideStore(databaseName, executor, nowMillis)
+    override val guides: DurableGuideStore = guideStore
 
     suspend fun initialize(startupCleanupRows: Int, cleanupGuidesOnStartup: Boolean) {
         command("open") { }
+        guideStore.migrateLegacyRows(startupCleanupRows)
         cleanupUnreachable(startupCleanupRows)
         if (cleanupGuidesOnStartup) guides.cleanupUnreachable(startupCleanupRows)
     }

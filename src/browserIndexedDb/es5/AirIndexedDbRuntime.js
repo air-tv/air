@@ -14,6 +14,8 @@
             guideGenerations: "guideGenerations",
             guideChannels: "guideChannels",
             guideProgrammes: "guideProgrammes",
+            guideTimeline: "guideTimeline",
+            guideMigration: "guideMigration",
             guideLeases: "guideLeases",
             guideCleanupQueue: "guideCleanupQueue",
         });
@@ -117,55 +119,14 @@
                         }
                     }
                     if (event.oldVersion < 4) {
-                        var upgrade = openRequest.transaction;
-                        var generations_1 = upgrade.objectStore(STORE_1.guideGenerations);
-                        var programmes_1 = upgrade.objectStore(STORE_1.guideProgrammes);
-                        if (!programmes_1.indexNames.contains("generationChannelFiniteStart")) {
-                            programmes_1.createIndex("generationChannelFiniteStart", ["generationKey", "channelKey", "finiteStartMs"], { unique: true });
+                        if (!database.objectStoreNames.contains(STORE_1.guideTimeline)) {
+                            var timeline = database.createObjectStore(STORE_1.guideTimeline, { keyPath: "key" });
+                            timeline.createIndex("generationChannelFiniteStart", ["generationKey", "channelKey", "finiteStartMs"], { unique: true });
+                            timeline.createIndex("generationChannelOpenStart", ["generationKey", "channelKey", "openStartMs"], { unique: true });
                         }
-                        if (!programmes_1.indexNames.contains("generationChannelOpenStart")) {
-                            programmes_1.createIndex("generationChannelOpenStart", ["generationKey", "channelKey", "openStartMs"], { unique: true });
+                        if (!database.objectStoreNames.contains(STORE_1.guideMigration)) {
+                            database.createObjectStore(STORE_1.guideMigration, { keyPath: "key" });
                         }
-                        var generationCursorRequest_1 = generations_1.openCursor();
-                        generationCursorRequest_1.onsuccess = function () {
-                            var generationCursor = generationCursorRequest_1.result;
-                            if (generationCursor) {
-                                var generation = generationCursor.value;
-                                generation.maxFiniteSpanMs = 0;
-                                generation.minStartMs = null;
-                                generationCursor.update(generation);
-                                generationCursor.continue();
-                                return;
-                            }
-                            var programmeCursorRequest = programmes_1.openCursor();
-                            programmeCursorRequest.onsuccess = function () {
-                                var programmeCursor = programmeCursorRequest.result;
-                                if (!programmeCursor)
-                                    return;
-                                var programme = programmeCursor.value;
-                                delete programme.finiteStartMs;
-                                delete programme.openStartMs;
-                                if (programme.endMs === null)
-                                    programme.openStartMs = programme.startMs;
-                                else
-                                    programme.finiteStartMs = programme.startMs;
-                                programmeCursor.update(programme);
-                                var generationRequest = generations_1.get(programme.generationKey);
-                                generationRequest.onsuccess = function () {
-                                    var generation = generationRequest.result;
-                                    if (generation) {
-                                        generation.minStartMs = generation.minStartMs === null
-                                            ? programme.startMs
-                                            : Math.min(generation.minStartMs, programme.startMs);
-                                        if (programme.endMs !== null) {
-                                            generation.maxFiniteSpanMs = Math.max(generation.maxFiniteSpanMs, programme.effectiveEndMs - programme.startMs);
-                                        }
-                                        generations_1.put(generation);
-                                    }
-                                    programmeCursor.continue();
-                                };
-                            };
-                        };
                     }
                 };
                 openRequest.onblocked = function () {
@@ -446,6 +407,20 @@
                 encodedFieldBytes_1(programme.description) + encodedFieldBytes_1(programme.episode) +
                 encodedFieldBytes_1(programme.artworkReference) + 4 +
                 programme.categories.reduce(function (total, category) { return total + encodedFieldBytes_1(category); }, 0);
+        };
+        var guideTimelineRow_1 = function (programme) {
+            var row = {
+                key: programme.key,
+                generationKey: programme.generationKey,
+                channelKey: programme.channelKey,
+                startMs: programme.startMs,
+                effectiveEndMs: programme.effectiveEndMs,
+            };
+            if (programme.endMs === null)
+                row.openStartMs = programme.startMs;
+            else
+                row.finiteStartMs = programme.startMs;
+            return row;
         };
         var guideQueuePut_1 = function (tx, generationKey, cleanupAt, kind) {
             if (kind === void 0) { kind = "generation"; }
@@ -785,6 +760,97 @@
                                 };
                             }, fail);
                         });
+                    case "guideMigrateLegacy":
+                        return transaction_1(database, [STORE_1.guideGenerations, STORE_1.guideProgrammes, STORE_1.guideTimeline, STORE_1.guideMigration], "readwrite", command.operationId, function (tx, setResult, fail) {
+                            var generations = tx.objectStore(STORE_1.guideGenerations);
+                            var programmes = tx.objectStore(STORE_1.guideProgrammes);
+                            var timeline = tx.objectStore(STORE_1.guideTimeline);
+                            var migrations = tx.objectStore(STORE_1.guideMigration);
+                            var stateRequest = migrations.get("legacy-v3");
+                            stateRequest.onerror = function () { return fail(classify_1(stateRequest.error)); };
+                            stateRequest.onsuccess = function () {
+                                var state = stateRequest.result || {
+                                    key: "legacy-v3",
+                                    afterKey: null,
+                                    pendingGenerationKey: null,
+                                    complete: false,
+                                };
+                                if (state.complete) {
+                                    setResult({ status: "ok", migratedRows: 0, hasMore: false });
+                                    return;
+                                }
+                                var migratedRows = 0;
+                                var finishGeneration = function (generationKey, done) {
+                                    if (generationKey === null) {
+                                        done();
+                                        return;
+                                    }
+                                    var request = generations.get(generationKey);
+                                    request.onerror = function () { return fail(classify_1(request.error)); };
+                                    request.onsuccess = function () {
+                                        var generation = request.result;
+                                        if (generation) {
+                                            generation.timelineMigrated = true;
+                                            generations.put(generation);
+                                        }
+                                        done();
+                                    };
+                                };
+                                var range = state.afterKey === null ? null : IDBKeyRange.lowerBound(state.afterKey, true);
+                                var cursorRequest = programmes.openCursor(range);
+                                cursorRequest.onerror = function () { return fail(classify_1(cursorRequest.error)); };
+                                cursorRequest.onsuccess = function () {
+                                    var cursor = cursorRequest.result;
+                                    if (!cursor) {
+                                        finishGeneration(state.pendingGenerationKey, function () {
+                                            state.pendingGenerationKey = null;
+                                            state.complete = true;
+                                            migrations.put(state);
+                                            setResult({ status: "ok", migratedRows: migratedRows, hasMore: false });
+                                        });
+                                        return;
+                                    }
+                                    if (migratedRows >= command.maxRows) {
+                                        migrations.put(state);
+                                        setResult({ status: "ok", migratedRows: migratedRows, hasMore: true });
+                                        return;
+                                    }
+                                    var programme = cursor.value;
+                                    var processRow = function () {
+                                        state.pendingGenerationKey = programme.generationKey;
+                                        var generationRequest = generations.get(programme.generationKey);
+                                        generationRequest.onerror = function () { return fail(classify_1(generationRequest.error)); };
+                                        generationRequest.onsuccess = function () {
+                                            var generation = generationRequest.result;
+                                            if (generation) {
+                                                if (!Number.isSafeInteger(generation.maxFiniteSpanMs))
+                                                    generation.maxFiniteSpanMs = 0;
+                                                if (!Number.isSafeInteger(generation.minStartMs))
+                                                    generation.minStartMs = programme.startMs;
+                                                else
+                                                    generation.minStartMs = Math.min(generation.minStartMs, programme.startMs);
+                                                if (programme.endMs !== null) {
+                                                    generation.maxFiniteSpanMs = Math.max(generation.maxFiniteSpanMs, programme.effectiveEndMs - programme.startMs);
+                                                }
+                                                generations.put(generation);
+                                            }
+                                            timeline.put(guideTimelineRow_1(programme));
+                                            state.afterKey = cursor.primaryKey;
+                                            migratedRows += 1;
+                                            cursor.continue();
+                                        };
+                                    };
+                                    if (state.pendingGenerationKey !== null &&
+                                        state.pendingGenerationKey !== programme.generationKey) {
+                                        var previous = state.pendingGenerationKey;
+                                        finishGeneration(previous, processRow);
+                                    }
+                                    else {
+                                        processRow();
+                                    }
+                                };
+                            };
+                        });
                     case "guideBegin":
                         return transaction_1(database, [STORE_1.guideStates, STORE_1.guideGenerations, STORE_1.guideCleanupQueue], "readwrite", command.operationId, function (tx, setResult, fail) {
                             var states = tx.objectStore(STORE_1.guideStates);
@@ -844,6 +910,7 @@
                                         openStartPrefix: command.openStartBase + component + "|",
                                         maxFiniteSpanMs: 0,
                                         minStartMs: null,
+                                        timelineMigrated: true,
                                         status: "staging",
                                         expiresAt: command.nowMs + command.generationIdleTimeoutMillis,
                                         batchCount: 0,
@@ -990,7 +1057,7 @@
                             };
                         });
                     case "guideStage":
-                        return transaction_1(database, [STORE_1.guideStates, STORE_1.guideGenerations, STORE_1.guideChannels, STORE_1.guideProgrammes, STORE_1.guideCleanupQueue], "readwrite", command.operationId, function (tx, setResult, fail) {
+                        return transaction_1(database, [STORE_1.guideStates, STORE_1.guideGenerations, STORE_1.guideChannels, STORE_1.guideProgrammes, STORE_1.guideTimeline, STORE_1.guideCleanupQueue], "readwrite", command.operationId, function (tx, setResult, fail) {
                             var generations = tx.objectStore(STORE_1.guideGenerations);
                             var generationRequest = generations.get(command.generationKey);
                             generationRequest.onerror = function () { return fail(classify_1(generationRequest.error)); };
@@ -1057,7 +1124,11 @@
                                                 return;
                                             }
                                             channelUpdates.forEach(function (row) { return channelsStore.put(row); });
-                                            programmeUpdates.forEach(function (row) { return programmesStore.put(row); });
+                                            var timelineStore = tx.objectStore(STORE_1.guideTimeline);
+                                            programmeUpdates.forEach(function (row) {
+                                                programmesStore.put(row);
+                                                timelineStore.put(guideTimelineRow_1(row));
+                                            });
                                             generation.channelCount = channelCount;
                                             generation.programmeCount = programmeCount;
                                             generation.expiresAt = command.nowMs + command.generationIdleTimeoutMillis;
@@ -1371,31 +1442,12 @@
                             }, setResult, fail);
                         });
                     case "durableGuideWindow":
-                        return transaction_1(database, [STORE_1.guideLeases, STORE_1.guideGenerations, STORE_1.guideProgrammes], "readonly", command.operationId, function (tx, setResult, fail) {
+                        return transaction_1(database, [STORE_1.guideLeases, STORE_1.guideGenerations, STORE_1.guideProgrammes, STORE_1.guideTimeline, STORE_1.guideMigration], "readonly", command.operationId, function (tx, setResult, fail) {
                             guideLease_1(tx, command, function (_lease, generation) {
-                                if (generation.minStartMs === null) {
-                                    setResult({ status: "ok", rows: [], nextStartMs: null, truncated: false, payloadBytes: 0 });
-                                    return;
-                                }
                                 var store = tx.objectStore(STORE_1.guideProgrammes);
-                                var finiteIndex = store.index("generationChannelFiniteStart");
-                                var openIndex = store.index("generationChannelOpenStart");
-                                var finiteFloor = Math.max(Number.MIN_SAFE_INTEGER, command.fromMs - generation.maxFiniteSpanMs);
-                                var finiteLower = command.afterStartMs === null
-                                    ? finiteFloor
-                                    : Math.max(finiteFloor, command.afterStartMs);
-                                var openLower = command.afterStartMs === null
-                                    ? generation.minStartMs
-                                    : Math.max(generation.minStartMs, command.afterStartMs);
-                                var finiteRange = IDBKeyRange.bound([generation.key, command.channelKey, finiteLower], [generation.key, command.channelKey, command.untilMs], command.afterStartMs !== null && command.afterStartMs >= finiteFloor, true);
-                                var openRange = IDBKeyRange.bound([generation.key, command.channelKey, openLower], [generation.key, command.channelKey, command.untilMs], command.afterStartMs !== null && command.afterStartMs >= generation.minStartMs, true);
                                 var rows = [];
                                 var payloadBytes = 0;
                                 var visits = 0;
-                                var finiteCursor;
-                                var openCursor;
-                                var finiteReady = false;
-                                var openReady = false;
                                 var finish = function (truncated) { return setResult({
                                     status: "ok",
                                     rows: rows,
@@ -1403,39 +1455,9 @@
                                     truncated: truncated,
                                     payloadBytes: payloadBytes,
                                 }); };
-                                var advance = function (kind, cursor) {
-                                    if (kind === "finite")
-                                        finiteReady = false;
-                                    else
-                                        openReady = false;
-                                    cursor.continue();
-                                };
-                                var pump = function () {
-                                    if (!finiteReady || !openReady)
-                                        return;
-                                    if (!finiteCursor && !openCursor) {
-                                        finish(false);
-                                        return;
-                                    }
-                                    var kind;
-                                    var cursor;
-                                    if (!openCursor || (finiteCursor && (finiteCursor.value.startMs < openCursor.value.startMs ||
-                                        (finiteCursor.value.startMs === openCursor.value.startMs && finiteCursor.primaryKey < openCursor.primaryKey)))) {
-                                        kind = "finite";
-                                        cursor = finiteCursor;
-                                    }
-                                    else {
-                                        kind = "open";
-                                        cursor = openCursor;
-                                    }
-                                    if (visits >= command.maxIndexVisits) {
-                                        setResult({ status: "limit" });
-                                        return;
-                                    }
-                                    visits += 1;
-                                    var row = cursor.value;
+                                var accept = function (row, locatorKey, advance) {
                                     if (row.effectiveEndMs <= command.fromMs) {
-                                        advance(kind, cursor);
+                                        advance();
                                         return;
                                     }
                                     var bytes = guideProgrammeBytes_1(row);
@@ -1443,16 +1465,108 @@
                                         finish(true);
                                         return;
                                     }
-                                    rows.push(Object.assign({ locatorKey: cursor.primaryKey }, row));
+                                    rows.push(Object.assign({ locatorKey: locatorKey }, row));
                                     payloadBytes += bytes;
-                                    advance(kind, cursor);
+                                    advance();
                                 };
-                                var finiteRequest = finiteIndex.openCursor(finiteRange);
-                                finiteRequest.onerror = function () { return fail(classify_1(finiteRequest.error)); };
-                                finiteRequest.onsuccess = function () { finiteCursor = finiteRequest.result; finiteReady = true; pump(); };
-                                var openRequest = openIndex.openCursor(openRange);
-                                openRequest.onerror = function () { return fail(classify_1(openRequest.error)); };
-                                openRequest.onsuccess = function () { openCursor = openRequest.result; openReady = true; pump(); };
+                                var runLegacy = function () {
+                                    var index = store.index("generationChannelStart");
+                                    var lower = command.afterStartMs === null ? Number.MIN_SAFE_INTEGER : command.afterStartMs;
+                                    var range = IDBKeyRange.bound([generation.key, command.channelKey, lower], [generation.key, command.channelKey, command.untilMs], command.afterStartMs !== null, true);
+                                    var request = index.openCursor(range);
+                                    request.onerror = function () { return fail(classify_1(request.error)); };
+                                    request.onsuccess = function () {
+                                        var cursor = request.result;
+                                        if (!cursor) {
+                                            finish(false);
+                                            return;
+                                        }
+                                        if (visits >= command.maxIndexVisits) {
+                                            setResult({ status: "limit" });
+                                            return;
+                                        }
+                                        visits += 1;
+                                        accept(cursor.value, cursor.primaryKey, function () { return cursor.continue(); });
+                                    };
+                                };
+                                var runTimeline = function () {
+                                    if (generation.minStartMs === null) {
+                                        finish(false);
+                                        return;
+                                    }
+                                    var timeline = tx.objectStore(STORE_1.guideTimeline);
+                                    var finiteIndex = timeline.index("generationChannelFiniteStart");
+                                    var openIndex = timeline.index("generationChannelOpenStart");
+                                    var finiteFloor = Math.max(Number.MIN_SAFE_INTEGER, command.fromMs - generation.maxFiniteSpanMs);
+                                    var finiteLower = command.afterStartMs === null
+                                        ? finiteFloor
+                                        : Math.max(finiteFloor, command.afterStartMs);
+                                    var openLower = command.afterStartMs === null
+                                        ? generation.minStartMs
+                                        : Math.max(generation.minStartMs, command.afterStartMs);
+                                    var finiteRange = IDBKeyRange.bound([generation.key, command.channelKey, finiteLower], [generation.key, command.channelKey, command.untilMs], command.afterStartMs !== null && command.afterStartMs >= finiteFloor, true);
+                                    var openRange = IDBKeyRange.bound([generation.key, command.channelKey, openLower], [generation.key, command.channelKey, command.untilMs], command.afterStartMs !== null && command.afterStartMs >= generation.minStartMs, true);
+                                    var finiteCursor;
+                                    var openCursor;
+                                    var finiteReady = false;
+                                    var openReady = false;
+                                    var advance = function (kind, cursor) {
+                                        if (kind === "finite")
+                                            finiteReady = false;
+                                        else
+                                            openReady = false;
+                                        cursor.continue();
+                                    };
+                                    var pump = function () {
+                                        if (!finiteReady || !openReady)
+                                            return;
+                                        if (!finiteCursor && !openCursor) {
+                                            finish(false);
+                                            return;
+                                        }
+                                        var kind;
+                                        var cursor;
+                                        if (!openCursor || (finiteCursor && (finiteCursor.value.startMs < openCursor.value.startMs ||
+                                            (finiteCursor.value.startMs === openCursor.value.startMs && finiteCursor.primaryKey < openCursor.primaryKey)))) {
+                                            kind = "finite";
+                                            cursor = finiteCursor;
+                                        }
+                                        else {
+                                            kind = "open";
+                                            cursor = openCursor;
+                                        }
+                                        if (visits >= command.maxIndexVisits) {
+                                            setResult({ status: "limit" });
+                                            return;
+                                        }
+                                        visits += 1;
+                                        var fullRequest = store.get(cursor.primaryKey);
+                                        fullRequest.onerror = function () { return fail(classify_1(fullRequest.error)); };
+                                        fullRequest.onsuccess = function () {
+                                            var row = fullRequest.result;
+                                            if (!row) {
+                                                advance(kind, cursor);
+                                                return;
+                                            }
+                                            accept(row, cursor.primaryKey, function () { return advance(kind, cursor); });
+                                        };
+                                    };
+                                    var finiteRequest = finiteIndex.openCursor(finiteRange);
+                                    finiteRequest.onerror = function () { return fail(classify_1(finiteRequest.error)); };
+                                    finiteRequest.onsuccess = function () { finiteCursor = finiteRequest.result; finiteReady = true; pump(); };
+                                    var openRequest = openIndex.openCursor(openRange);
+                                    openRequest.onerror = function () { return fail(classify_1(openRequest.error)); };
+                                    openRequest.onsuccess = function () { openCursor = openRequest.result; openReady = true; pump(); };
+                                };
+                                var migrationRequest = tx.objectStore(STORE_1.guideMigration).get("legacy-v3");
+                                migrationRequest.onerror = function () { return fail(classify_1(migrationRequest.error)); };
+                                migrationRequest.onsuccess = function () {
+                                    var migration = migrationRequest.result;
+                                    if (generation.timelineMigrated === true || (migration && migration.complete))
+                                        runTimeline();
+                                    else
+                                        runLegacy();
+                                };
                             }, setResult, fail);
                         });
                     case "guideNowNext":
@@ -1548,6 +1662,7 @@
                                             openStartPrefix: command.openStartBase + component + "|",
                                             maxFiniteSpanMs: 0,
                                             minStartMs: null,
+                                            timelineMigrated: true,
                                             status: "staging",
                                             purpose: "prune",
                                             expiresAt: command.nowMs + command.generationIdleTimeoutMillis,
@@ -1714,6 +1829,7 @@
                             STORE_1.guideGenerations,
                             STORE_1.guideChannels,
                             STORE_1.guideProgrammes,
+                            STORE_1.guideTimeline,
                             STORE_1.guideLeases,
                             STORE_1.guideCleanupQueue,
                         ], "readwrite", command.operationId, function (tx, setResult, fail) {
@@ -1764,8 +1880,8 @@
                                     var remaining = command.maxRows;
                                     var removed = 0;
                                     var tasks = [
-                                        [STORE_1.guideChannels, generation.channelPrefix],
-                                        [STORE_1.guideProgrammes, generation.programmePrefix],
+                                        [STORE_1.guideChannels, generation.channelPrefix, false],
+                                        [STORE_1.guideProgrammes, generation.programmePrefix, true],
                                     ];
                                     var taskIndex = 0;
                                     var runTask = function () {
@@ -1783,6 +1899,8 @@
                                                 return;
                                             }
                                             cursor.delete();
+                                            if (task[2])
+                                                tx.objectStore(STORE_1.guideTimeline).delete(cursor.primaryKey);
                                             remaining -= 1;
                                             removed += 1;
                                             cursor.continue();
@@ -1891,6 +2009,8 @@
                             STORE_1.guideGenerations,
                             STORE_1.guideChannels,
                             STORE_1.guideProgrammes,
+                            STORE_1.guideTimeline,
+                            STORE_1.guideMigration,
                             STORE_1.guideLeases,
                             STORE_1.guideCleanupQueue,
                         ], "readonly", command.operationId, function (tx, setResult, fail) {
@@ -1899,6 +2019,8 @@
                                 STORE_1.guideGenerations,
                                 STORE_1.guideChannels,
                                 STORE_1.guideProgrammes,
+                                STORE_1.guideTimeline,
+                                STORE_1.guideMigration,
                                 STORE_1.guideLeases,
                                 STORE_1.guideCleanupQueue,
                             ];

@@ -35,6 +35,15 @@ internal class IndexedDbDurableGuideStore(
     private val ownerId = randomOpaque("owner")
     private var operationCounter = 0L
 
+    suspend fun migrateLegacyRows(maxRows: Int): DurableGuideCleanupResult {
+        val result = command("guideMigrateLegacy") { put("maxRows", maxRows) }.objectResult()
+        result.throwExpectedFailure()
+        return DurableGuideCleanupResult(
+            result.requiredLong("migratedRows").toInt(),
+            result.requiredBoolean("hasMore"),
+        )
+    }
+
     override suspend fun beginRefresh(
         key: DurableGuideKey,
         retention: DurableGuideRetention,

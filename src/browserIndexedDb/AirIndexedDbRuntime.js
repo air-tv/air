@@ -14,6 +14,8 @@
       guideGenerations: "guideGenerations",
       guideChannels: "guideChannels",
       guideProgrammes: "guideProgrammes",
+      guideTimeline: "guideTimeline",
+      guideMigration: "guideMigration",
       guideLeases: "guideLeases",
       guideCleanupQueue: "guideCleanupQueue",
     });
@@ -115,63 +117,22 @@
             }
           }
           if (event.oldVersion < 4) {
-            const upgrade = openRequest.transaction;
-            const generations = upgrade.objectStore(STORE.guideGenerations);
-            const programmes = upgrade.objectStore(STORE.guideProgrammes);
-            if (!programmes.indexNames.contains("generationChannelFiniteStart")) {
-              programmes.createIndex(
+            if (!database.objectStoreNames.contains(STORE.guideTimeline)) {
+              const timeline = database.createObjectStore(STORE.guideTimeline, { keyPath: "key" });
+              timeline.createIndex(
                 "generationChannelFiniteStart",
                 ["generationKey", "channelKey", "finiteStartMs"],
                 { unique: true },
               );
-            }
-            if (!programmes.indexNames.contains("generationChannelOpenStart")) {
-              programmes.createIndex(
+              timeline.createIndex(
                 "generationChannelOpenStart",
                 ["generationKey", "channelKey", "openStartMs"],
                 { unique: true },
               );
             }
-            const generationCursorRequest = generations.openCursor();
-            generationCursorRequest.onsuccess = () => {
-              const generationCursor = generationCursorRequest.result;
-              if (generationCursor) {
-                const generation = generationCursor.value;
-                generation.maxFiniteSpanMs = 0;
-                generation.minStartMs = null;
-                generationCursor.update(generation);
-                generationCursor.continue();
-                return;
-              }
-              const programmeCursorRequest = programmes.openCursor();
-              programmeCursorRequest.onsuccess = () => {
-                const programmeCursor = programmeCursorRequest.result;
-                if (!programmeCursor) return;
-                const programme = programmeCursor.value;
-                delete programme.finiteStartMs;
-                delete programme.openStartMs;
-                if (programme.endMs === null) programme.openStartMs = programme.startMs;
-                else programme.finiteStartMs = programme.startMs;
-                programmeCursor.update(programme);
-                const generationRequest = generations.get(programme.generationKey);
-                generationRequest.onsuccess = () => {
-                  const generation = generationRequest.result;
-                  if (generation) {
-                    generation.minStartMs = generation.minStartMs === null
-                      ? programme.startMs
-                      : Math.min(generation.minStartMs, programme.startMs);
-                    if (programme.endMs !== null) {
-                      generation.maxFiniteSpanMs = Math.max(
-                        generation.maxFiniteSpanMs,
-                        programme.effectiveEndMs - programme.startMs,
-                      );
-                    }
-                    generations.put(generation);
-                  }
-                  programmeCursor.continue();
-                };
-              };
-            };
+            if (!database.objectStoreNames.contains(STORE.guideMigration)) {
+              database.createObjectStore(STORE.guideMigration, { keyPath: "key" });
+            }
           }
         };
         openRequest.onblocked = () => {
@@ -409,6 +370,18 @@
       encodedFieldBytes(programme.description) + encodedFieldBytes(programme.episode) +
       encodedFieldBytes(programme.artworkReference) + 4 +
       programme.categories.reduce((total, category) => total + encodedFieldBytes(category), 0);
+    const guideTimelineRow = (programme) => {
+      const row = {
+        key: programme.key,
+        generationKey: programme.generationKey,
+        channelKey: programme.channelKey,
+        startMs: programme.startMs,
+        effectiveEndMs: programme.effectiveEndMs,
+      };
+      if (programme.endMs === null) row.openStartMs = programme.startMs;
+      else row.finiteStartMs = programme.startMs;
+      return row;
+    };
     const guideQueuePut = (tx, generationKey, cleanupAt, kind = "generation") => {
       tx.objectStore(STORE.guideCleanupQueue).put({
         key: "Q|" + generationKey,
@@ -686,6 +659,95 @@
               };
             }, fail);
           });
+        case "guideMigrateLegacy":
+          return transaction(database, [STORE.guideGenerations, STORE.guideProgrammes, STORE.guideTimeline, STORE.guideMigration], "readwrite", command.operationId, (tx, setResult, fail) => {
+            const generations = tx.objectStore(STORE.guideGenerations);
+            const programmes = tx.objectStore(STORE.guideProgrammes);
+            const timeline = tx.objectStore(STORE.guideTimeline);
+            const migrations = tx.objectStore(STORE.guideMigration);
+            const stateRequest = migrations.get("legacy-v3");
+            stateRequest.onerror = () => fail(classify(stateRequest.error));
+            stateRequest.onsuccess = () => {
+              const state = stateRequest.result || {
+                key: "legacy-v3",
+                afterKey: null,
+                pendingGenerationKey: null,
+                complete: false,
+              };
+              if (state.complete) {
+                setResult({ status: "ok", migratedRows: 0, hasMore: false });
+                return;
+              }
+              let migratedRows = 0;
+              const finishGeneration = (generationKey, done) => {
+                if (generationKey === null) { done(); return; }
+                const request = generations.get(generationKey);
+                request.onerror = () => fail(classify(request.error));
+                request.onsuccess = () => {
+                  const generation = request.result;
+                  if (generation) {
+                    generation.timelineMigrated = true;
+                    generations.put(generation);
+                  }
+                  done();
+                };
+              };
+              const range = state.afterKey === null ? null : IDBKeyRange.lowerBound(state.afterKey, true);
+              const cursorRequest = programmes.openCursor(range);
+              cursorRequest.onerror = () => fail(classify(cursorRequest.error));
+              cursorRequest.onsuccess = () => {
+                const cursor = cursorRequest.result;
+                if (!cursor) {
+                  finishGeneration(state.pendingGenerationKey, () => {
+                    state.pendingGenerationKey = null;
+                    state.complete = true;
+                    migrations.put(state);
+                    setResult({ status: "ok", migratedRows: migratedRows, hasMore: false });
+                  });
+                  return;
+                }
+                if (migratedRows >= command.maxRows) {
+                  migrations.put(state);
+                  setResult({ status: "ok", migratedRows: migratedRows, hasMore: true });
+                  return;
+                }
+                const programme = cursor.value;
+                const processRow = () => {
+                  state.pendingGenerationKey = programme.generationKey;
+                  const generationRequest = generations.get(programme.generationKey);
+                  generationRequest.onerror = () => fail(classify(generationRequest.error));
+                  generationRequest.onsuccess = () => {
+                    const generation = generationRequest.result;
+                    if (generation) {
+                      if (!Number.isSafeInteger(generation.maxFiniteSpanMs)) generation.maxFiniteSpanMs = 0;
+                      if (!Number.isSafeInteger(generation.minStartMs)) generation.minStartMs = programme.startMs;
+                      else generation.minStartMs = Math.min(generation.minStartMs, programme.startMs);
+                      if (programme.endMs !== null) {
+                        generation.maxFiniteSpanMs = Math.max(
+                          generation.maxFiniteSpanMs,
+                          programme.effectiveEndMs - programme.startMs,
+                        );
+                      }
+                      generations.put(generation);
+                    }
+                    timeline.put(guideTimelineRow(programme));
+                    state.afterKey = cursor.primaryKey;
+                    migratedRows += 1;
+                    cursor.continue();
+                  };
+                };
+                if (
+                  state.pendingGenerationKey !== null &&
+                  state.pendingGenerationKey !== programme.generationKey
+                ) {
+                  const previous = state.pendingGenerationKey;
+                  finishGeneration(previous, processRow);
+                } else {
+                  processRow();
+                }
+              };
+            };
+          });
         case "guideBegin":
           return transaction(database, [STORE.guideStates, STORE.guideGenerations, STORE.guideCleanupQueue], "readwrite", command.operationId, (tx, setResult, fail) => {
             const states = tx.objectStore(STORE.guideStates);
@@ -740,6 +802,7 @@
                   openStartPrefix: command.openStartBase + component + "|",
                   maxFiniteSpanMs: 0,
                   minStartMs: null,
+                  timelineMigrated: true,
                   status: "staging",
                   expiresAt: command.nowMs + command.generationIdleTimeoutMillis,
                   batchCount: 0,
@@ -875,7 +938,7 @@
             };
           });
         case "guideStage":
-          return transaction(database, [STORE.guideStates, STORE.guideGenerations, STORE.guideChannels, STORE.guideProgrammes, STORE.guideCleanupQueue], "readwrite", command.operationId, (tx, setResult, fail) => {
+          return transaction(database, [STORE.guideStates, STORE.guideGenerations, STORE.guideChannels, STORE.guideProgrammes, STORE.guideTimeline, STORE.guideCleanupQueue], "readwrite", command.operationId, (tx, setResult, fail) => {
             const generations = tx.objectStore(STORE.guideGenerations);
             const generationRequest = generations.get(command.generationKey);
             generationRequest.onerror = () => fail(classify(generationRequest.error));
@@ -935,7 +998,11 @@
                     return;
                   }
                   channelUpdates.forEach((row) => channelsStore.put(row));
-                  programmeUpdates.forEach((row) => programmesStore.put(row));
+                  const timelineStore = tx.objectStore(STORE.guideTimeline);
+                  programmeUpdates.forEach((row) => {
+                    programmesStore.put(row);
+                    timelineStore.put(guideTimelineRow(row));
+                  });
                   generation.channelCount = channelCount;
                   generation.programmeCount = programmeCount;
                   generation.expiresAt = command.nowMs + command.generationIdleTimeoutMillis;
@@ -1227,44 +1294,12 @@
             }, setResult, fail);
           });
         case "durableGuideWindow":
-          return transaction(database, [STORE.guideLeases, STORE.guideGenerations, STORE.guideProgrammes], "readonly", command.operationId, (tx, setResult, fail) => {
+          return transaction(database, [STORE.guideLeases, STORE.guideGenerations, STORE.guideProgrammes, STORE.guideTimeline, STORE.guideMigration], "readonly", command.operationId, (tx, setResult, fail) => {
             guideLease(tx, command, (_lease, generation) => {
-              if (generation.minStartMs === null) {
-                setResult({ status: "ok", rows: [], nextStartMs: null, truncated: false, payloadBytes: 0 });
-                return;
-              }
               const store = tx.objectStore(STORE.guideProgrammes);
-              const finiteIndex = store.index("generationChannelFiniteStart");
-              const openIndex = store.index("generationChannelOpenStart");
-              const finiteFloor = Math.max(
-                Number.MIN_SAFE_INTEGER,
-                command.fromMs - generation.maxFiniteSpanMs,
-              );
-              const finiteLower = command.afterStartMs === null
-                ? finiteFloor
-                : Math.max(finiteFloor, command.afterStartMs);
-              const openLower = command.afterStartMs === null
-                ? generation.minStartMs
-                : Math.max(generation.minStartMs, command.afterStartMs);
-              const finiteRange = IDBKeyRange.bound(
-                [generation.key, command.channelKey, finiteLower],
-                [generation.key, command.channelKey, command.untilMs],
-                command.afterStartMs !== null && command.afterStartMs >= finiteFloor,
-                true,
-              );
-              const openRange = IDBKeyRange.bound(
-                [generation.key, command.channelKey, openLower],
-                [generation.key, command.channelKey, command.untilMs],
-                command.afterStartMs !== null && command.afterStartMs >= generation.minStartMs,
-                true,
-              );
               const rows = [];
               let payloadBytes = 0;
               let visits = 0;
-              let finiteCursor;
-              let openCursor;
-              let finiteReady = false;
-              let openReady = false;
               const finish = (truncated) => setResult({
                 status: "ok",
                 rows: rows,
@@ -1272,42 +1307,105 @@
                 truncated: truncated,
                 payloadBytes: payloadBytes,
               });
-              const advance = (kind, cursor) => {
-                if (kind === "finite") finiteReady = false;
-                else openReady = false;
-                cursor.continue();
-              };
-              const pump = () => {
-                if (!finiteReady || !openReady) return;
-                if (!finiteCursor && !openCursor) { finish(false); return; }
-                let kind;
-                let cursor;
-                if (!openCursor || (finiteCursor && (
-                  finiteCursor.value.startMs < openCursor.value.startMs ||
-                  (finiteCursor.value.startMs === openCursor.value.startMs && finiteCursor.primaryKey < openCursor.primaryKey)
-                ))) {
-                  kind = "finite"; cursor = finiteCursor;
-                } else {
-                  kind = "open"; cursor = openCursor;
-                }
-                if (visits >= command.maxIndexVisits) { setResult({ status: "limit" }); return; }
-                visits += 1;
-                const row = cursor.value;
-                if (row.effectiveEndMs <= command.fromMs) { advance(kind, cursor); return; }
+              const accept = (row, locatorKey, advance) => {
+                if (row.effectiveEndMs <= command.fromMs) { advance(); return; }
                 const bytes = guideProgrammeBytes(row);
                 if (rows.length >= command.limit || payloadBytes + bytes > command.payloadByteLimit) {
                   finish(true); return;
                 }
-                rows.push(Object.assign({ locatorKey: cursor.primaryKey }, row));
+                rows.push(Object.assign({ locatorKey: locatorKey }, row));
                 payloadBytes += bytes;
-                advance(kind, cursor);
+                advance();
               };
-              const finiteRequest = finiteIndex.openCursor(finiteRange);
-              finiteRequest.onerror = () => fail(classify(finiteRequest.error));
-              finiteRequest.onsuccess = () => { finiteCursor = finiteRequest.result; finiteReady = true; pump(); };
-              const openRequest = openIndex.openCursor(openRange);
-              openRequest.onerror = () => fail(classify(openRequest.error));
-              openRequest.onsuccess = () => { openCursor = openRequest.result; openReady = true; pump(); };
+              const runLegacy = () => {
+                const index = store.index("generationChannelStart");
+                const lower = command.afterStartMs === null ? Number.MIN_SAFE_INTEGER : command.afterStartMs;
+                const range = IDBKeyRange.bound(
+                  [generation.key, command.channelKey, lower],
+                  [generation.key, command.channelKey, command.untilMs],
+                  command.afterStartMs !== null,
+                  true,
+                );
+                const request = index.openCursor(range);
+                request.onerror = () => fail(classify(request.error));
+                request.onsuccess = () => {
+                  const cursor = request.result;
+                  if (!cursor) { finish(false); return; }
+                  if (visits >= command.maxIndexVisits) { setResult({ status: "limit" }); return; }
+                  visits += 1;
+                  accept(cursor.value, cursor.primaryKey, () => cursor.continue());
+                };
+              };
+              const runTimeline = () => {
+                if (generation.minStartMs === null) { finish(false); return; }
+                const timeline = tx.objectStore(STORE.guideTimeline);
+                const finiteIndex = timeline.index("generationChannelFiniteStart");
+                const openIndex = timeline.index("generationChannelOpenStart");
+                const finiteFloor = Math.max(Number.MIN_SAFE_INTEGER, command.fromMs - generation.maxFiniteSpanMs);
+                const finiteLower = command.afterStartMs === null
+                  ? finiteFloor
+                  : Math.max(finiteFloor, command.afterStartMs);
+                const openLower = command.afterStartMs === null
+                  ? generation.minStartMs
+                  : Math.max(generation.minStartMs, command.afterStartMs);
+                const finiteRange = IDBKeyRange.bound(
+                  [generation.key, command.channelKey, finiteLower],
+                  [generation.key, command.channelKey, command.untilMs],
+                  command.afterStartMs !== null && command.afterStartMs >= finiteFloor,
+                  true,
+                );
+                const openRange = IDBKeyRange.bound(
+                  [generation.key, command.channelKey, openLower],
+                  [generation.key, command.channelKey, command.untilMs],
+                  command.afterStartMs !== null && command.afterStartMs >= generation.minStartMs,
+                  true,
+                );
+                let finiteCursor;
+                let openCursor;
+                let finiteReady = false;
+                let openReady = false;
+                const advance = (kind, cursor) => {
+                  if (kind === "finite") finiteReady = false;
+                  else openReady = false;
+                  cursor.continue();
+                };
+                const pump = () => {
+                  if (!finiteReady || !openReady) return;
+                  if (!finiteCursor && !openCursor) { finish(false); return; }
+                  let kind;
+                  let cursor;
+                  if (!openCursor || (finiteCursor && (
+                    finiteCursor.value.startMs < openCursor.value.startMs ||
+                    (finiteCursor.value.startMs === openCursor.value.startMs && finiteCursor.primaryKey < openCursor.primaryKey)
+                  ))) {
+                    kind = "finite"; cursor = finiteCursor;
+                  } else {
+                    kind = "open"; cursor = openCursor;
+                  }
+                  if (visits >= command.maxIndexVisits) { setResult({ status: "limit" }); return; }
+                  visits += 1;
+                  const fullRequest = store.get(cursor.primaryKey);
+                  fullRequest.onerror = () => fail(classify(fullRequest.error));
+                  fullRequest.onsuccess = () => {
+                    const row = fullRequest.result;
+                    if (!row) { advance(kind, cursor); return; }
+                    accept(row, cursor.primaryKey, () => advance(kind, cursor));
+                  };
+                };
+                const finiteRequest = finiteIndex.openCursor(finiteRange);
+                finiteRequest.onerror = () => fail(classify(finiteRequest.error));
+                finiteRequest.onsuccess = () => { finiteCursor = finiteRequest.result; finiteReady = true; pump(); };
+                const openRequest = openIndex.openCursor(openRange);
+                openRequest.onerror = () => fail(classify(openRequest.error));
+                openRequest.onsuccess = () => { openCursor = openRequest.result; openReady = true; pump(); };
+              };
+              const migrationRequest = tx.objectStore(STORE.guideMigration).get("legacy-v3");
+              migrationRequest.onerror = () => fail(classify(migrationRequest.error));
+              migrationRequest.onsuccess = () => {
+                const migration = migrationRequest.result;
+                if (generation.timelineMigrated === true || (migration && migration.complete)) runTimeline();
+                else runLegacy();
+              };
             }, setResult, fail);
           });
         case "guideNowNext":
@@ -1395,6 +1493,7 @@
                     openStartPrefix: command.openStartBase + component + "|",
                     maxFiniteSpanMs: 0,
                     minStartMs: null,
+                    timelineMigrated: true,
                     status: "staging",
                     purpose: "prune",
                     expiresAt: command.nowMs + command.generationIdleTimeoutMillis,
@@ -1533,6 +1632,7 @@
             STORE.guideGenerations,
             STORE.guideChannels,
             STORE.guideProgrammes,
+            STORE.guideTimeline,
             STORE.guideLeases,
             STORE.guideCleanupQueue,
           ], "readwrite", command.operationId, (tx, setResult, fail) => {
@@ -1582,8 +1682,8 @@
                 let remaining = command.maxRows;
                 let removed = 0;
                 const tasks = [
-                  [STORE.guideChannels, generation.channelPrefix],
-                  [STORE.guideProgrammes, generation.programmePrefix],
+                  [STORE.guideChannels, generation.channelPrefix, false],
+                  [STORE.guideProgrammes, generation.programmePrefix, true],
                 ];
                 let taskIndex = 0;
                 const runTask = () => {
@@ -1595,6 +1695,7 @@
                     const cursor = request.result;
                     if (!cursor || remaining === 0) { runTask(); return; }
                     cursor.delete();
+                    if (task[2]) tx.objectStore(STORE.guideTimeline).delete(cursor.primaryKey);
                     remaining -= 1;
                     removed += 1;
                     cursor.continue();
@@ -1691,6 +1792,8 @@
             STORE.guideGenerations,
             STORE.guideChannels,
             STORE.guideProgrammes,
+            STORE.guideTimeline,
+            STORE.guideMigration,
             STORE.guideLeases,
             STORE.guideCleanupQueue,
           ], "readonly", command.operationId, (tx, setResult, fail) => {
@@ -1699,6 +1802,8 @@
               STORE.guideGenerations,
               STORE.guideChannels,
               STORE.guideProgrammes,
+              STORE.guideTimeline,
+              STORE.guideMigration,
               STORE.guideLeases,
               STORE.guideCleanupQueue,
             ];
