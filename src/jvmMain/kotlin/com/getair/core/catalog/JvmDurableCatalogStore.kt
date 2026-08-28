@@ -30,5 +30,6 @@ suspend fun openJvmDurableCatalogStore(
         SqlDelightDurableCatalogStore(driver, dispatcher)
     }
     store.cleanupUnreachable(options.startupCleanupRows)
+    store.guides.cleanupUnreachable(options.startupCleanupRows)
     return store
 }

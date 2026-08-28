@@ -51,6 +51,14 @@ internal class SqlDelightDurableCatalogStore(
     private val databaseDispatcher = dispatcher
     private val writer = Mutex()
 
+    override val guides: DurableGuideStore = SqlDelightDurableGuideStore(
+        driver = driver,
+        database = database,
+        dispatcher = databaseDispatcher,
+        writer = writer,
+        nowMillis = nowMillis,
+    )
+
     override suspend fun beginRefresh(sourceId: LocalSourceId): CatalogGeneration = serializedWrite {
         var generation = 0L
         database.transaction {
