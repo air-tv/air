@@ -1,13 +1,14 @@
 # Air application core
 
 Local-first Kotlin Multiplatform application state for Air. Source composites
-are the temporary checked-in default until the first Stremio and IPTV packages
-are released. This default is explicit in `gradle.properties`; Gradle never
-enables a composite merely because a sibling directory exists.
+are the temporary checked-in default until explicit KMP package releases are
+selected. This default is explicit in `gradle.properties`; Gradle never enables
+a composite merely because a sibling directory exists.
 
-The package path already uses pinned release coordinates for the Stremio, IPTV,
-and video contracts. GitHub Packages requires authentication even when these
-packages and repositories are public.
+Package mode has no implicit or checked-in release versions. It requires an
+explicit stable `MAJOR.MINOR.PATCH` version for each Stremio, IPTV, and video
+contract. GitHub Packages requires authentication even when these packages and
+repositories are public.
 
 For package consumption, provide credentials outside the repository through
 `GITHUB_ACTOR`/`GITHUB_TOKEN`, or through these entries in the user-level
@@ -25,22 +26,26 @@ requires all three sibling checkouts and runs normally:
 ./gradlew jvmTest --max-workers=2
 ```
 
-To test only the pinned packages, explicitly override the temporary default:
+To test released packages, explicitly override the temporary default and name
+all three versions:
 
 ```bash
-./gradlew -PuseLocalAirBuilds=false assertPackageDependencyMode \
+./gradlew -PuseLocalAirBuilds=false \
+  -PgetAirStremioVersion=X.Y.Z -PgetAirIptvVersion=X.Y.Z \
+  -PgetAirVideoVersion=X.Y.Z assertPackageDependencyMode \
   compileCommonMainKotlinMetadata compileKotlinJvm compileKotlinJs \
   compileKotlinWasmJs --max-workers=2
 ```
 
 CI composite builds explicitly opt in and check out immutable commit SHAs. The
-manual `Package Consumer` workflow uses the explicit false override and is the
-clean no-composite gate; it is intentionally not part of required main CI until
-every pinned package version exists.
+manual `Package Consumer` workflow requires the same three version inputs and
+uses the explicit false override. It is intentionally not part of required main
+CI until authorized package releases exist.
 
-Required CI also proves the package graph before those public releases exist.
-It publishes the immutable sibling refs into one isolated `file://` Maven
-repository, then compiles Air with composites disabled. The non-secret
+Required CI proves the package graph without assigning a public release
+version. It publishes the immutable sibling refs as `0.0.0-ci` into one isolated
+`file://` Maven repository, then compiles Air with composites disabled and all
+three versions explicitly set to that fixture version. The non-secret
 `getAirPackageRepository` Gradle property (or
 `GET_AIR_PACKAGE_REPOSITORY` environment variable) exists only for this local
 file-repository gate; ordinary package builds continue to use authenticated

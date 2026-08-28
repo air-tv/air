@@ -7,14 +7,8 @@ kotlinx-serialization = "1.8.0"
 kotlinx-browser = "0.3"
 sqldelight = "2.1.0"
 sqlite-jdbc = "3.51.3.0"
-getair-stremio = "0.1.0"
-getair-iptv = "0.1.0"
-getair-video = "0.2.0"
 
 [libraries]
-getair-iptv = { module = "com.getair:iptv", version.ref = "getair-iptv" }
-getair-stremio = { module = "com.getair:stremio-addon-client", version.ref = "getair-stremio" }
-getair-video = { module = "com.getair:video", version.ref = "getair-video" }
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinx-coroutines" }
 kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "kotlinx-coroutines" }
 kotlinx-datetime = { module = "org.jetbrains.kotlinx:kotlinx-datetime", version.ref = "kotlinx-datetime" }

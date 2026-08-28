@@ -2,6 +2,19 @@ name: Package Consumer
 
 on:
   workflow_dispatch:
+    inputs:
+      stremio_version:
+        description: Stable Stremio KMP package version
+        required: true
+        type: string
+      iptv_version:
+        description: Stable IPTV KMP package version
+        required: true
+        type: string
+      video_version:
+        description: Stable video KMP package version
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -17,6 +30,9 @@ jobs:
       AIR_USE_LOCAL_BUILDS: "false"
       GITHUB_ACTOR: ${{ github.actor }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GET_AIR_STREMIO_VERSION: ${{ inputs.stremio_version }}
+      GET_AIR_IPTV_VERSION: ${{ inputs.iptv_version }}
+      GET_AIR_VIDEO_VERSION: ${{ inputs.video_version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -25,7 +41,7 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      - name: Verify pinned GitHub Packages without composite substitution
+      - name: Verify explicit GitHub Packages without composite substitution
         run: >-
           ./gradlew
           assertPackageDependencyMode

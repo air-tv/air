@@ -66,8 +66,8 @@ publish_contract() {
   )
 }
 
-publish_contract stremio-addon-client 0.1.0
-publish_contract iptv 0.1.0
-publish_contract video 0.2.0
+publish_contract stremio-addon-client 0.0.0-ci
+publish_contract iptv 0.0.0-ci
+publish_contract video 0.0.0-ci
 
 test -n "$(find "$repository_path/com/getair" -type f -name '*.pom' -print -quit)"

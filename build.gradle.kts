@@ -18,6 +18,49 @@ plugins {
 group = "com.getair"
 version = "0.1.0-SNAPSHOT"
 
+val useLocalAirBuilds = providers.gradleProperty("useLocalAirBuilds")
+    .orElse(providers.environmentVariable("AIR_USE_LOCAL_BUILDS"))
+    .map { value ->
+        when (value.trim().lowercase()) {
+            "true", "1", "yes" -> true
+            "false", "0", "no" -> false
+            else -> error("useLocalAirBuilds/AIR_USE_LOCAL_BUILDS must be true or false")
+        }
+    }
+    .getOrElse(false)
+val packageRepositoryOverride = providers.gradleProperty("getAirPackageRepository")
+    .orElse(providers.environmentVariable("GET_AIR_PACKAGE_REPOSITORY"))
+    .orNull
+    ?.trim()
+    ?.takeIf(String::isNotEmpty)
+val stablePackageVersion = Regex("^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$")
+
+fun getAirContractVersion(property: String, environment: String): String {
+    val explicit = providers.gradleProperty(property)
+        .orElse(providers.environmentVariable(environment))
+        .orNull
+        ?.trim()
+        ?.takeIf(String::isNotEmpty)
+    if (useLocalAirBuilds) return explicit ?: "0.0.0-local"
+    require(explicit != null) {
+        "$property/$environment is required when local Air composites are disabled"
+    }
+    if (packageRepositoryOverride == null) {
+        require(stablePackageVersion.matches(explicit)) {
+            "$property must be a stable MAJOR.MINOR.PATCH GitHub package version"
+        }
+    } else {
+        require(explicit == "0.0.0-ci" || stablePackageVersion.matches(explicit)) {
+            "$property must be 0.0.0-ci or stable MAJOR.MINOR.PATCH for a file repository"
+        }
+    }
+    return explicit
+}
+
+val getAirStremioVersion = getAirContractVersion("getAirStremioVersion", "GET_AIR_STREMIO_VERSION")
+val getAirIptvVersion = getAirContractVersion("getAirIptvVersion", "GET_AIR_IPTV_VERSION")
+val getAirVideoVersion = getAirContractVersion("getAirVideoVersion", "GET_AIR_VIDEO_VERSION")
+
 @OptIn(ExperimentalWasmDsl::class)
 kotlin {
     jvmToolchain(17)
@@ -94,9 +137,9 @@ kotlin {
             iosSimulatorArm64Test,
         ).forEach { it.get().dependsOn(nativeTest) }
         commonMain.dependencies {
-            api(libs.getair.iptv)
-            api(libs.getair.stremio)
-            api(libs.getair.video)
+            api("com.getair:iptv:$getAirIptvVersion")
+            api("com.getair:stremio-addon-client:$getAirStremioVersion")
+            api("com.getair:video:$getAirVideoVersion")
             api(libs.kotlinx.coroutines.core)
             api(libs.kotlinx.datetime)
             implementation(libs.kotlinx.serialization.json)

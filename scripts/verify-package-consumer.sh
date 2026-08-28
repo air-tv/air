@@ -14,12 +14,12 @@ script_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 air_directory="$(cd "$script_directory/.." && pwd)"
 
 for coordinate in \
-  stremio-addon-client/0.1.0/stremio-addon-client-0.1.0.module \
-  iptv/0.1.0/iptv-0.1.0.module \
-  video/0.2.0/video-0.2.0.module \
-  stremio-addon-client-mingwx64/0.1.0/stremio-addon-client-mingwx64-0.1.0.klib \
-  iptv-iosarm64/0.1.0/iptv-iosarm64-0.1.0.klib \
-  video-macosarm64/0.2.0/video-macosarm64-0.2.0.klib
+  stremio-addon-client/0.0.0-ci/stremio-addon-client-0.0.0-ci.module \
+  iptv/0.0.0-ci/iptv-0.0.0-ci.module \
+  video/0.0.0-ci/video-0.0.0-ci.module \
+  stremio-addon-client-mingwx64/0.0.0-ci/stremio-addon-client-mingwx64-0.0.0-ci.klib \
+  iptv-iosarm64/0.0.0-ci/iptv-iosarm64-0.0.0-ci.klib \
+  video-macosarm64/0.0.0-ci/video-macosarm64-0.0.0-ci.klib
 do
   test -f "$repository_path/com/getair/$coordinate"
 done
@@ -38,6 +38,9 @@ AIR_SQLITE_LIBRARY_DIR="$(dirname "$sqlite_library")" ./gradlew \
   compileKotlinLinuxX64 \
   -PuseLocalAirBuilds=false \
   -PgetAirPackageRepository="$repository_uri" \
+  -PgetAirStremioVersion=0.0.0-ci \
+  -PgetAirIptvVersion=0.0.0-ci \
+  -PgetAirVideoVersion=0.0.0-ci \
   --refresh-dependencies \
   --max-workers=2 \
   --no-daemon \
