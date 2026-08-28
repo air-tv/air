@@ -37,6 +37,14 @@ profile using typed Stremio movie/series IDs or IPTV movie/episode IDs. Live TV
 cannot enter the model. Completed items leave the shelf, each profile is
 bounded, and future history sync remains optional.
 
+Household/settings, non-secret source metadata, and Continue Watching can be
+opened as versioned persistent JSON documents through one `LocalDocumentStore`.
+`JvmFileDocumentStore`, `AndroidFileDocumentStore`, and
+`AppleFileDocumentStore` use atomic replacement; a failed durable write never
+updates the observable `StateFlow`. Android stores these documents under the
+app's no-backup directory. Provider credentials and configured URLs remain in
+the separate OS credential vault and never enter these documents.
+
 ```bash
 ./gradlew jvmTest jsNodeTest wasmJsNodeTest
 ```
