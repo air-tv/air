@@ -179,6 +179,8 @@ class LatestTuneCoordinatorTest {
         val failed = assertIs<TuneOutcome.Failed>(failing.tune(request("channel")))
         assertEquals(TuneFailureStage.RESOLVE_TARGET, failed.stage)
         assertFalse(failed.toString().contains("password"))
+        assertFalse(TuneTargetId("https://user:password@example.invalid").toString().contains("password"))
+        assertFalse(source.toString().contains("provider-one"))
     }
 
     @Test

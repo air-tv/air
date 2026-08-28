@@ -15,6 +15,8 @@ import kotlin.jvm.JvmInline
 @JvmInline
 value class LocalSourceId(val value: String) {
     init { require(value.isNotBlank() && value.length <= 128 && '\u0000' !in value) }
+
+    override fun toString(): String = "LocalSourceId(<redacted>)"
 }
 
 @Serializable

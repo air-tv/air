@@ -20,6 +20,8 @@ value class TuneTargetId(val value: String) {
     init {
         require(value.isNotBlank() && value.length <= 256 && '\u0000' !in value)
     }
+
+    override fun toString(): String = "TuneTargetId(<redacted>)"
 }
 
 data class TuneRequest(
