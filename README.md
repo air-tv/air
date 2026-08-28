@@ -25,6 +25,11 @@ URLs and headers, and Stremio manifest URLs stay behind a required
 `LocalSourceSecretStore`. Only metadata has an optional future sync source;
 browser persistence and plaintext production vaults are not supplied.
 
+`LocalFirstContinueWatchingRepository` keeps resume progress per household
+profile using typed Stremio movie/series IDs or IPTV movie/episode IDs. Live TV
+cannot enter the model. Completed items leave the shelf, each profile is
+bounded, and future history sync remains optional.
+
 ```bash
 ./gradlew jvmTest jsNodeTest wasmJsNodeTest
 ```

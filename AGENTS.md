@@ -4,6 +4,7 @@
 - The default data path is local-only. `LocalFirstMediaRepository` may accept a future `MediaSyncSource`, but ordinary construction must never require a server.
 - Household profiles and settings live in `LocalFirstHouseholdRepository`; keep profile playback/language choices separate from device OLED/motion/decoder settings, and keep current-profile reselection a no-op so TV navigation cannot trigger needless state churn.
 - `LocalSourceRegistry` separates ordinary source metadata from `LocalSourceSecretStore`. Xtream/Stalker credentials, M3U/XMLTV URLs/headers, and Stremio manifest URLs never enter serializable metadata or future metadata sync. The memory vault is test/ephemeral-only.
+- Continue Watching is profile-scoped `OnDemandContentRef` state. Do not store stream URLs or headers in history, do not admit live channels, drop completed entries at the configured threshold, and keep writes/no-op reselection bounded to avoid home-shelf churn.
 - Store and expose the exact normalized contracts from sibling libraries. Do not create parallel UI-shaped copies of Stremio or IPTV protocol data here.
 - Authentication supports device-code/QR and username/password through `TvAuthGateway`. The gateway is replaceable; this repository never embeds a server URL or vendor SDK.
 - Device codes, passwords, tokens, QR payloads, provider URLs, and playback headers must be redacted from `toString`, logs, analytics, and errors.
