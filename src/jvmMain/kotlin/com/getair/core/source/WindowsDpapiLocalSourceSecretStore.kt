@@ -157,6 +157,7 @@ private fun LocalSourceId.dpapiEntry(): String = MessageDigest.getInstance("SHA-
 
 private val WRITE_SCRIPT = """
     ${'$'}ErrorActionPreference = 'Stop'
+    Add-Type -AssemblyName System.Security
     ${'$'}path = ${'$'}env:AIR_TV_VAULT_TARGET
     ${'$'}input = [Console]::In.ReadToEnd().Trim()
     ${'$'}plain = [Convert]::FromBase64String(${'$'}input)
@@ -178,6 +179,7 @@ private val WRITE_SCRIPT = """
 
 private val READ_SCRIPT = """
     ${'$'}ErrorActionPreference = 'Stop'
+    Add-Type -AssemblyName System.Security
     ${'$'}path = ${'$'}env:AIR_TV_VAULT_TARGET
     if (-not (Test-Path -LiteralPath ${'$'}path -PathType Leaf)) { exit 3 }
     ${'$'}protected = [IO.File]::ReadAllBytes(${'$'}path)
