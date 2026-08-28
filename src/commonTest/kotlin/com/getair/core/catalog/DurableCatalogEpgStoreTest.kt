@@ -27,6 +27,7 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -106,6 +107,47 @@ class DurableCatalogEpgStoreTest {
         val emptyWindow = adapter.visibleWindow(guide, emptyList(), instant(8_000), instant(20_000))
         assertEquals(info.revision, emptyWindow.revision)
         assertTrue(emptyWindow.channels.isEmpty())
+
+        val prefixShapedRawId = EpgChannelId(matched.channel.id.value)
+        val adversarial = adapter.refresh(
+            guide,
+            flowOf(
+                EpgBatch(
+                    channels = listOf(
+                        channel.copy(displayNames = listOf("Victim")),
+                        EpgChannel(prefixShapedRawId, listOf("Prefix shaped")),
+                    ),
+                    programmes = listOf(
+                        programme(rawChannel, 20_000, 21_000, "Victim programme"),
+                        programme(prefixShapedRawId, 21_000, 22_000, "Prefix programme"),
+                    ),
+                    totalChannels = 2,
+                    totalProgrammes = 2,
+                ),
+            ),
+            instant(20_000),
+        )
+        assertEquals(2, adversarial.channelCount)
+        val victimMatch = assertIs<EpgMatchResult.Matched>(
+            adapter.matchChannel(guide, entry.copy(name = "Victim", epgChannelId = rawChannel)).result,
+        )
+        val prefixMatch = assertIs<EpgMatchResult.Matched>(
+            adapter.matchChannel(
+                guide,
+                entry.copy(id = PlaylistEntryId("prefix-entry"), name = "Prefix shaped", epgChannelId = prefixShapedRawId),
+            ).result,
+        )
+        assertNotEquals(victimMatch.channel.id, prefixMatch.channel.id)
+        val adversarialWindow = adapter.visibleWindow(
+            guide,
+            listOf(victimMatch.channel.id, prefixMatch.channel.id),
+            instant(19_000),
+            instant(23_000),
+        )
+        assertEquals(
+            listOf("Victim programme", "Prefix programme"),
+            adversarialWindow.channels.map { it.programmes.single().title },
+        )
 
         val otherGuide = guide("source-one", "feed-two")
         adapter.refresh(
@@ -224,6 +266,12 @@ class DurableCatalogEpgStoreTest {
         assertTrue(pruned.existed)
         assertEquals(1, pruned.removedProgrammes)
         assertEquals(1, pruned.remainingProgrammes)
+        val deleted = adapter.prune(guide, instant(1_000_000))
+        assertTrue(deleted.existed)
+        assertNull(deleted.revision)
+        assertEquals(1, deleted.removedProgrammes)
+        assertEquals(0, deleted.remainingProgrammes)
+        assertNull(adapter.snapshotInfo(guide))
         adapter.close()
         adapter.close()
         assertTrue(catalog.closed)

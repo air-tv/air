@@ -261,13 +261,13 @@ class DurableCatalogEpgStore(
             ?: return EpgChannelMatchAtRevision(null, EpgMatchResult.Unmatched)
         val transformed = entry.copy(
             id = PlaylistEntryId(hash("air-epg-entry-v1", guide.sourceId.value, entry.id.value)),
-            epgChannelId = entry.epgChannelId?.let { EpgChannelId(guide.channelHandle(it.value)) },
+            epgChannelId = entry.epgChannelId?.let { EpgChannelId(guide.rawChannelHandle(it.value)) },
         )
         val overrides = buildMap {
             options.overrides.forEach { (rawKey, rawValue) ->
-                val value = EpgChannelId(guide.channelHandle(rawValue.value))
+                val value = EpgChannelId(guide.rawChannelHandle(rawValue.value))
                 put(hash("air-epg-entry-v1", guide.sourceId.value, rawKey), value)
-                put(guide.channelHandle(rawKey), value)
+                put(guide.rawChannelHandle(rawKey), value)
             }
         }
         val index = if (options.fuzzyPolicy == EpgFuzzyPolicy.Disabled) cache.exact else cache.fuzzy
@@ -289,7 +289,7 @@ class DurableCatalogEpgStore(
             EpgNowNext(null, null), null, EpgQueryWork(1, 0, 0, 0),
         )
         return try {
-            val value = durable.nowNext(lease, DurableGuideChannelKey(guide.channelDigest(channelId.value)), at)
+            val value = durable.nowNext(lease, DurableGuideChannelKey(guide.queryChannelDigest(channelId.value)), at)
             EpgNowNextResult(
                 EpgNowNext(
                     value.current?.toEpg(channelId),
@@ -322,7 +322,7 @@ class DurableCatalogEpgStore(
             ?: return EpgWindowResult(emptyList(), null, false, EpgQueryWork(1, 0, 0, 0))
         return try {
             val request = DurableGuideMultiChannelWindowRequest(
-                unique.map { DurableGuideChannelKey(guide.channelDigest(it.value)) },
+                unique.map { DurableGuideChannelKey(guide.queryChannelDigest(it.value)) },
                 start,
                 endExclusive,
                 perChannelLimit = minOf(limits.maxProgrammesPerWindowQuery, DurableGuideLimits.MAX_WINDOW_ITEMS),
@@ -369,7 +369,7 @@ class DurableCatalogEpgStore(
             return when (val deleted = durable.deleteGuide(key, snapshot.revision, snapshot.mutationEpoch)) {
                 is DurableGuideDeleteResult.Deleted -> {
                     mutex.withLock { channelCaches.remove(guide) }
-                    EpgPruneResult(true, deleted.revision, removed, 0)
+                    EpgPruneResult(true, null, removed, 0)
                 }
                 is DurableGuideDeleteResult.Superseded -> {
                     val current = deleted.current
@@ -545,19 +545,18 @@ private fun EpgGuideKey.durableKey(): DurableGuideKey = DurableGuideKey(
     DurableGuideFeedId(feedId.value),
 )
 
-private fun EpgGuideKey.channelDigest(rawChannelId: String): String =
-    if (isChannelHandle(rawChannelId)) {
-        channelDigestFromHandle(rawChannelId)
-    } else {
-        hash("air-guide-channel-v1", sourceId.value, feedId.value, rawChannelId)
-    }
+private fun EpgGuideKey.rawChannelDigest(rawChannelId: String): String =
+    hash("air-guide-channel-v1", sourceId.value, feedId.value, rawChannelId)
 
-private fun EpgGuideKey.channelHandle(rawChannelId: String): String =
-    if (isChannelHandle(rawChannelId)) rawChannelId else CHANNEL_HANDLE_PREFIX + channelDigest(rawChannelId)
+private fun EpgGuideKey.queryChannelDigest(channelId: String): String =
+    if (isChannelHandle(channelId)) channelDigestFromHandle(channelId) else rawChannelDigest(channelId)
+
+private fun EpgGuideKey.rawChannelHandle(rawChannelId: String): String =
+    CHANNEL_HANDLE_PREFIX + rawChannelDigest(rawChannelId)
 
 private fun EpgChannel.toDurable(guide: EpgGuideKey): DurableGuideChannelRecord =
     DurableGuideChannelRecord(
-        DurableGuideChannelKey(guide.channelDigest(id.value)),
+        DurableGuideChannelKey(guide.rawChannelDigest(id.value)),
         displayNames = displayNames.take(DurableGuideLimits.MAX_DISPLAY_NAMES).map {
             bounded(it, DurableGuideLimits.MAX_DISPLAY_NAME_CHARS)
         }.filter(String::isNotBlank).ifEmpty { listOf("Channel") },
@@ -566,7 +565,7 @@ private fun EpgChannel.toDurable(guide: EpgGuideKey): DurableGuideChannelRecord 
 
 private fun EpgProgramme.toDurable(guide: EpgGuideKey): DurableGuideProgrammeRecord =
     DurableGuideProgrammeRecord(
-        channelKey = DurableGuideChannelKey(guide.channelDigest(channelId.value)),
+        channelKey = DurableGuideChannelKey(guide.rawChannelDigest(channelId.value)),
         start = start,
         end = end,
         title = bounded(title, DurableGuideLimits.MAX_TITLE_CHARS),
