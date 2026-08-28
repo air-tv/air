@@ -18,6 +18,8 @@ env:
 jobs:
   package-fixture-linux:
     runs-on: ubuntu-latest
+    outputs:
+      fixture-sha256: ${{ steps.fixture-manifest.outputs.sha256 }}
     defaults:
       run:
         working-directory: air
@@ -48,6 +50,11 @@ jobs:
       - run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
       - name: Publish Linux-owned package fixture
         run: ./scripts/publish-package-fixture.sh linux "$RUNNER_TEMP/air-maven"
+      - id: fixture-manifest
+        name: Hash every Linux fixture file
+        run: |
+          manifest_hash="$(./scripts/write-package-fixture-manifest.sh "$RUNNER_TEMP/air-maven")"
+          printf 'sha256=%s\n' "$manifest_hash" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: air-packages-linux
@@ -57,6 +64,8 @@ jobs:
 
   package-fixture-apple:
     runs-on: macos-latest
+    outputs:
+      fixture-sha256: ${{ steps.fixture-manifest.outputs.sha256 }}
     defaults:
       run:
         working-directory: air
@@ -85,6 +94,11 @@ jobs:
           java-version: "17"
       - name: Publish Apple-owned package fixture
         run: ./scripts/publish-package-fixture.sh apple "$RUNNER_TEMP/air-maven"
+      - id: fixture-manifest
+        name: Hash every Apple fixture file
+        run: |
+          manifest_hash="$(./scripts/write-package-fixture-manifest.sh "$RUNNER_TEMP/air-maven")"
+          printf 'sha256=%s\n' "$manifest_hash" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: air-packages-apple
@@ -94,6 +108,8 @@ jobs:
 
   package-fixture-windows:
     runs-on: windows-latest
+    outputs:
+      fixture-sha256: ${{ steps.fixture-manifest.outputs.sha256 }}
     defaults:
       run:
         shell: bash
@@ -123,6 +139,11 @@ jobs:
           java-version: "17"
       - name: Publish Windows-owned package fixture
         run: ./scripts/publish-package-fixture.sh windows "$RUNNER_TEMP/air-maven"
+      - id: fixture-manifest
+        name: Hash every Windows fixture file
+        run: |
+          manifest_hash="$(./scripts/write-package-fixture-manifest.sh "$RUNNER_TEMP/air-maven")"
+          printf 'sha256=%s\n' "$manifest_hash" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: air-packages-windows
@@ -160,6 +181,18 @@ jobs:
         with:
           name: air-packages-windows
           path: ${{ runner.temp }}/air-package-fixtures/windows
+      - name: Verify every downloaded fixture byte
+        env:
+          LINUX_FIXTURE_SHA256: ${{ needs.package-fixture-linux.outputs.fixture-sha256 }}
+          APPLE_FIXTURE_SHA256: ${{ needs.package-fixture-apple.outputs.fixture-sha256 }}
+          WINDOWS_FIXTURE_SHA256: ${{ needs.package-fixture-windows.outputs.fixture-sha256 }}
+        run: |
+          ./scripts/verify-package-fixture-manifest.sh \
+            "$RUNNER_TEMP/air-package-fixtures/linux" "$LINUX_FIXTURE_SHA256"
+          ./scripts/verify-package-fixture-manifest.sh \
+            "$RUNNER_TEMP/air-package-fixtures/apple" "$APPLE_FIXTURE_SHA256"
+          ./scripts/verify-package-fixture-manifest.sh \
+            "$RUNNER_TEMP/air-package-fixtures/windows" "$WINDOWS_FIXTURE_SHA256"
       - name: Merge host fixtures without overwriting coordinates
         run: >-
           ./scripts/merge-package-fixtures.sh
