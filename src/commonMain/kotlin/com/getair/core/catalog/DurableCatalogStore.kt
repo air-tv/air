@@ -114,6 +114,13 @@ data class CatalogStorageOptions(
  * playback-bearing channel/movie/episode models have no storage variant here.
  */
 interface DurableCatalogStore {
+    /**
+     * Feed-scoped durable guide storage. Existing stores remain media-capable
+     * while returning an explicit unsupported capability until migrated.
+     */
+    val guides: DurableGuideStore
+        get() = UnsupportedDurableGuideStore
+
     suspend fun beginRefresh(sourceId: LocalSourceId): CatalogGeneration
 
     /** Appends one bounded, single-catalog batch to an unreachable generation. */
