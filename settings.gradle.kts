@@ -15,6 +15,11 @@ dependencyResolutionManagement {
             .orElse(providers.environmentVariable("GITHUB_ACTOR"))
         val packageToken = providers.gradleProperty("githubPackagesToken")
             .orElse(providers.environmentVariable("GITHUB_TOKEN"))
+        val packageRepositoryOverride = providers.gradleProperty("getAirPackageRepository")
+            .orElse(providers.environmentVariable("GET_AIR_PACKAGE_REPOSITORY"))
+            .orNull
+            ?.trim()
+            ?.takeIf(String::isNotEmpty)
 
         fun org.gradle.api.artifacts.dsl.RepositoryHandler.getAirPackage(
             repository: String,
@@ -37,9 +42,25 @@ dependencyResolutionManagement {
             }
         }
 
-        getAirPackage("stremio-addon-client", "stremio-addon-client(?:-.*)?")
-        getAirPackage("iptv", "iptv(?:-.*)?")
-        getAirPackage("video", "video(?:-.*)?")
+        if (packageRepositoryOverride != null) {
+            val repositoryUri = uri(packageRepositoryOverride)
+            require(repositoryUri.scheme == "file") {
+                "getAirPackageRepository/GET_AIR_PACKAGE_REPOSITORY must be a file:// repository"
+            }
+            exclusiveContent {
+                forRepository {
+                    maven {
+                        name = "getAirPackageOverride"
+                        url = repositoryUri
+                    }
+                }
+                filter { includeGroup("com.getair") }
+            }
+        } else {
+            getAirPackage("stremio-addon-client", "stremio-addon-client(?:-.*)?")
+            getAirPackage("iptv", "iptv(?:-.*)?")
+            getAirPackage("video", "video(?:-.*)?")
+        }
     }
 }
 

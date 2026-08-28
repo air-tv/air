@@ -16,6 +16,160 @@ env:
   AIR_VIDEO_REF: 7164066dd4b1bf74e45b2a50b80b1118cca4b54e
 
 jobs:
+  package-fixture-linux:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: air
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: air
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: get-air/stremio-addon-client
+          ref: ${{ env.AIR_STREMIO_REF }}
+          path: stremio-addon-client
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: get-air/iptv
+          ref: ${{ env.AIR_IPTV_REF }}
+          path: iptv
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: get-air/video
+          ref: ${{ env.AIR_VIDEO_REF }}
+          path: video
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+      - run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+      - name: Publish Linux-owned package fixture
+        run: ./scripts/publish-package-fixture.sh linux "$RUNNER_TEMP/air-maven"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: air-packages-linux
+          path: ${{ runner.temp }}/air-maven
+          if-no-files-found: error
+          retention-days: 1
+
+  package-fixture-apple:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: air
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: air
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: get-air/stremio-addon-client
+          ref: ${{ env.AIR_STREMIO_REF }}
+          path: stremio-addon-client
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: get-air/iptv
+          ref: ${{ env.AIR_IPTV_REF }}
+          path: iptv
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: get-air/video
+          ref: ${{ env.AIR_VIDEO_REF }}
+          path: video
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Publish Apple-owned package fixture
+        run: ./scripts/publish-package-fixture.sh apple "$RUNNER_TEMP/air-maven"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: air-packages-apple
+          path: ${{ runner.temp }}/air-maven
+          if-no-files-found: error
+          retention-days: 1
+
+  package-fixture-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: air
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: air
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: get-air/stremio-addon-client
+          ref: ${{ env.AIR_STREMIO_REF }}
+          path: stremio-addon-client
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: get-air/iptv
+          ref: ${{ env.AIR_IPTV_REF }}
+          path: iptv
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: get-air/video
+          ref: ${{ env.AIR_VIDEO_REF }}
+          path: video
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Publish Windows-owned package fixture
+        run: ./scripts/publish-package-fixture.sh windows "$RUNNER_TEMP/air-maven"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: air-packages-windows
+          path: ${{ runner.temp }}/air-maven
+          if-no-files-found: error
+          retention-days: 1
+
+  package-contract:
+    needs: [package-fixture-linux, package-fixture-apple, package-fixture-windows]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: air
+    env:
+      AIR_USE_LOCAL_BUILDS: "false"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: air
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+      - run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: air-packages-linux
+          path: ${{ runner.temp }}/air-package-fixtures/linux
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: air-packages-apple
+          path: ${{ runner.temp }}/air-package-fixtures/apple
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: air-packages-windows
+          path: ${{ runner.temp }}/air-package-fixtures/windows
+      - name: Merge host fixtures without overwriting coordinates
+        run: >-
+          ./scripts/merge-package-fixtures.sh
+          "$RUNNER_TEMP/air-maven"
+          "$RUNNER_TEMP/air-package-fixtures/linux"
+          "$RUNNER_TEMP/air-package-fixtures/apple"
+          "$RUNNER_TEMP/air-package-fixtures/windows"
+      - name: Compile every Air target from packages only
+        run: ./scripts/verify-package-consumer.sh "$RUNNER_TEMP/air-maven"
+
   portable:
     runs-on: ubuntu-latest
     defaults:

@@ -38,6 +38,14 @@ manual `Package Consumer` workflow uses the explicit false override and is the
 clean no-composite gate; it is intentionally not part of required main CI until
 every pinned package version exists.
 
+Required CI also proves the package graph before those public releases exist.
+It publishes the immutable sibling refs into one isolated `file://` Maven
+repository, then compiles Air with composites disabled. The non-secret
+`getAirPackageRepository` Gradle property (or
+`GET_AIR_PACKAGE_REPOSITORY` environment variable) exists only for this local
+file-repository gate; ordinary package builds continue to use authenticated
+GitHub Packages.
+
 The default repository has no server. A future backend can implement
 `MediaSyncSource` without changing UI callers. TV authentication similarly
 uses the replaceable `TvAuthGateway` contract for device-code/QR and
