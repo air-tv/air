@@ -23,11 +23,7 @@ kotlin {
             binaries.all {
                 linkerOpts(
                     "-L$sqliteLibraryDirectory",
-                    "-lsqlite3",
-                    "-ldl",
-                    "-lpthread",
-                    "-lm",
-                    "-Wl,--defsym=fcntl64=fcntl",
+                    "-Wl,--allow-shlib-undefined",
                 )
             }
         }

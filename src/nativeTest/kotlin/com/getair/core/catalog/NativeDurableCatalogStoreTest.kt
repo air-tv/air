@@ -9,7 +9,10 @@ import kotlin.test.assertEquals
 class NativeDurableCatalogStoreTest {
     @Test
     fun nativeDriverActivatesAndReadsOneGeneration() = runTest {
-        val store = openNativeDurableCatalogStore(":memory:")
+        // SQLiter's Windows backend does not consistently honor SQLite's
+        // magic in-memory filename across externally supplied SQLite builds.
+        // Hosted runners are ephemeral, so use an ordinary private test file.
+        val store = openNativeDurableCatalogStore("air-native-catalog-test.db")
         try {
             val source = LocalSourceId("native-source")
             val catalog = DurableCatalogKey(DurableCatalogKind.Stremio, "native")

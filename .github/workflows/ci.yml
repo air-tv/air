@@ -122,12 +122,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes libsqlite3-dev
-          sqlite_library="$(cc -print-file-name=libsqlite3.a)"
+          sqlite_library="$(cc -print-file-name=libsqlite3.so)"
           test -f "$sqlite_library"
-          sqlite_static_dir="$RUNNER_TEMP/air-sqlite-static"
-          mkdir -p "$sqlite_static_dir"
-          cp "$sqlite_library" "$sqlite_static_dir/libsqlite3.a"
-          echo "AIR_SQLITE_LIBRARY_DIR=$sqlite_static_dir" >> "$GITHUB_ENV"
+          echo "AIR_SQLITE_LIBRARY_DIR=$(dirname "$sqlite_library")" >> "$GITHUB_ENV"
       - name: Install Windows SQLite development library
         if: runner.os == 'Windows'
         shell: pwsh
