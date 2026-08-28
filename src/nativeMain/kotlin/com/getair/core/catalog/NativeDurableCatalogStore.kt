@@ -21,7 +21,9 @@ suspend fun openNativeDurableCatalogStore(
     val dispatcher = Dispatchers.Default.limitedParallelism(1)
     val store = withContext(dispatcher) {
         val driver = NativeSqliteDriver(AirCatalogDatabase.Schema, databaseName)
-        driver.execute(null, "PRAGMA journal_mode=DELETE", 0)
+        // SQLite defaults to the rollback journal. Do not execute the
+        // row-returning `PRAGMA journal_mode=DELETE` through the driver's
+        // non-query API; WAL remains deliberately disabled by this store.
         driver.execute(null, "PRAGMA synchronous=FULL", 0)
         driver.execute(null, "PRAGMA busy_timeout=5000", 0)
         SqlDelightDurableCatalogStore(driver, dispatcher)
