@@ -119,4 +119,12 @@ jobs:
           sqlite_library="$(cc -print-file-name=libsqlite3.so)"
           test -f "$sqlite_library"
           echo "AIR_SQLITE_LIBRARY_DIR=$(dirname "$sqlite_library")" >> "$GITHUB_ENV"
+      - name: Install Windows SQLite development library
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          C:\msys64\usr\bin\bash.exe -lc "pacman -S --noconfirm --needed mingw-w64-x86_64-sqlite3"
+          $sqliteLibrary = 'C:\msys64\mingw64\lib\libsqlite3.dll.a'
+          if (-not (Test-Path $sqliteLibrary)) { throw 'MSYS2 SQLite import library is missing' }
+          "AIR_SQLITE_LIBRARY_DIR=C:/msys64/mingw64/lib" >> $env:GITHUB_ENV
       - run: ./gradlew ${{ matrix.tasks }}

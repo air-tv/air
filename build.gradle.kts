@@ -26,6 +26,11 @@ kotlin {
         }
     }
     mingwX64 {
+        providers.environmentVariable("AIR_SQLITE_LIBRARY_DIR").orNull?.let { sqliteLibraryDirectory ->
+            binaries.all {
+                linkerOpts("-L$sqliteLibraryDirectory")
+            }
+        }
         compilations.getByName("main") {
             cinterops.create("wincred")
         }
