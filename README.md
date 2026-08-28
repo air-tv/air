@@ -23,14 +23,15 @@ accepts a `HouseholdSyncSource` only when a future server exists.
 ordinary local state. Exact `XtreamCredentials`/`StalkerCredentials`, M3U/XMLTV
 URLs and headers, and Stremio manifest URLs stay behind a required
 `LocalSourceSecretStore`. Production adapters use Android Keystore plus AES-GCM,
-native Apple Keychain, native Windows Credential Manager, or KDE Wallet from the
-Linux JVM target without libsecret. Windows payloads use generation-addressed
-chunks so Credential Manager's small blob limit cannot truncate Stalker fields
-or request headers. A Compose/JVM macOS or Windows shell will still need a tiny
-native vault bridge; plaintext fallback is not acceptable. Only metadata has an
-optional future sync source. Browser persistence and plaintext production vaults
-are deliberately not supplied because browser storage is not an OS credential
-vault.
+native Apple Keychain, native Windows Credential Manager, KDE Wallet from the
+Linux JVM target without libsecret, or current-user DPAPI from the Windows JVM
+target. Native Windows payloads use generation-addressed chunks so Credential
+Manager's small blob limit cannot truncate Stalker fields or request headers.
+The Windows Compose/JVM adapter sends payloads only through PowerShell stdin and
+atomically stores DPAPI ciphertext under hashed source IDs. Plaintext fallback
+is not acceptable. Only metadata has an optional future sync source. Browser
+persistence and plaintext production vaults are deliberately not supplied
+because browser storage is not an OS credential vault.
 
 `LocalFirstContinueWatchingRepository` keeps resume progress per household
 profile using typed Stremio movie/series IDs or IPTV movie/episode IDs. Live TV
@@ -48,10 +49,11 @@ configured URLs remain in the separate OS credential vault and never enter
 these documents or browser localStorage.
 
 Shell setup is one suspend call: `openAndroidLocalApplicationState`,
-`openAppleLocalApplicationState`, `openLinuxLocalApplicationState`, or
-`openBrowserLocalApplicationState`. Each composes durable documents, the
-platform credential vault, and local-first repositories without a DI container.
-Browser source credentials are intentionally session-only.
+`openAppleLocalApplicationState`, `openLinuxLocalApplicationState`,
+`openWindowsLocalApplicationState`, or `openBrowserLocalApplicationState`.
+Each composes durable documents, the platform credential vault, and local-first
+repositories without a DI container. Browser source credentials are
+intentionally session-only.
 
 ```bash
 ./gradlew jvmTest jsNodeTest wasmJsNodeTest

@@ -72,7 +72,10 @@ jobs:
           distribution: temurin
           java-version: "17"
       - name: Verify atomic JVM document replacement on Windows
-        run: ./gradlew jvmTest --tests com.getair.core.persistence.JvmFileDocumentStoreTest
+        run: >-
+          ./gradlew jvmTest
+          --tests com.getair.core.persistence.JvmFileDocumentStoreTest
+          --tests com.getair.core.source.WindowsDpapiLocalSourceSecretStoreTest
 
   native:
     strategy:
