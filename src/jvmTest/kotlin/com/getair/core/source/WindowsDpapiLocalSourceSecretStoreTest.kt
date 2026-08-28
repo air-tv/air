@@ -39,6 +39,7 @@ class WindowsDpapiLocalSourceSecretStoreTest {
             val request = runner.requests.single()
             assertTrue(request.standardInput?.isNotBlank() == true)
             assertTrue("Add-Type -AssemblyName System.Security" in request.script)
+            assertTrue("OpenStandardInput" in request.script)
             assertFalse("provider.invalid" in request.script)
             assertFalse("provider.invalid" in request.target.toString())
             assertEquals(secret, store.read(LocalSourceId("living-room")))

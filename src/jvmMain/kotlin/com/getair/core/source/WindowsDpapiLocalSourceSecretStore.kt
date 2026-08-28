@@ -161,8 +161,14 @@ private val WRITE_SCRIPT = """
     ${'$'}ErrorActionPreference = 'Stop'
     Add-Type -AssemblyName System.Security
     ${'$'}path = ${'$'}env:AIR_TV_VAULT_TARGET
-    ${'$'}input = [Console]::In.ReadToEnd().Trim()
-    ${'$'}plain = [Convert]::FromBase64String(${'$'}input)
+    ${'$'}reader = [IO.StreamReader]::new([Console]::OpenStandardInput(), [Text.Encoding]::UTF8)
+    try {
+        ${'$'}encodedCredential = ${'$'}reader.ReadToEnd().Trim()
+    } finally {
+        ${'$'}reader.Dispose()
+    }
+    if ([String]::IsNullOrWhiteSpace(${'$'}encodedCredential)) { throw 'Credential payload is empty' }
+    ${'$'}plain = [Convert]::FromBase64String(${'$'}encodedCredential)
     ${'$'}protected = [Security.Cryptography.ProtectedData]::Protect(
         ${'$'}plain,
         ${'$'}null,
