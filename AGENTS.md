@@ -5,5 +5,6 @@
 - Store and expose the exact normalized contracts from sibling libraries. Do not create parallel UI-shaped copies of Stremio or IPTV protocol data here.
 - Authentication supports device-code/QR and username/password through `TvAuthGateway`. The gateway is replaceable; this repository never embeds a server URL or vendor SDK.
 - Device codes, passwords, tokens, QR payloads, provider URLs, and playback headers must be redacted from `toString`, logs, analytics, and errors.
+- Serialize auth state transitions, enforce device-code expiry before polling, and always rethrow `CancellationException`; cancellation is lifecycle control, not an authentication failure.
 - Public async work is suspend; ongoing state is `StateFlow`. Keep constructors small and avoid DI frameworks.
 - JDK 17 and Kotlin 2.1.10 are canonical. Run `./gradlew jvmTest jsNodeTest wasmJsNodeTest` for portable changes.

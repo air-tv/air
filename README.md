@@ -8,6 +8,11 @@ The default repository has no server. A future backend can implement
 uses the replaceable `TvAuthGateway` contract for device-code/QR and
 username/password flows.
 
+Auth commands are serialized so rapid remote input cannot race device-code,
+password, and sign-out transitions. Device codes are rejected locally at their
+expiry instant, and coroutine cancellation always propagates instead of being
+rendered as a fake authentication failure.
+
 ```bash
 ./gradlew jvmTest jsNodeTest wasmJsNodeTest
 ```
