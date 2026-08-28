@@ -29,7 +29,7 @@ dependencyResolutionManagement {
                 forRepository {
                     maven {
                         name = "getAir${repository.replaceFirstChar(Char::uppercaseChar)}"
-                        url = uri("https://maven.pkg.github.com/get-air/$repository")
+                        url = uri("https://maven.pkg.github.com/air-tv/$repository")
                         credentials {
                             username = packageUser.orNull
                             password = packageToken.orNull

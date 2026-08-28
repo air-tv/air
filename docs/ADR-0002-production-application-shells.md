@@ -63,7 +63,7 @@ full target matrix before changing the workspace compiler baseline.
 
 ## Decision
 
-Create one production application repository, provisionally `get-air/app`,
+Create one production application repository, provisionally `air-tv/app`,
 only when implementation begins. Keep the minimum justified structure:
 
 ```text

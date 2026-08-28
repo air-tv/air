@@ -29,17 +29,17 @@ jobs:
           path: air
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: get-air/stremio-addon-client
+          repository: air-tv/stremio-addon-client
           ref: ${{ env.AIR_STREMIO_REF }}
           path: stremio-addon-client
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: get-air/iptv
+          repository: air-tv/iptv
           ref: ${{ env.AIR_IPTV_REF }}
           path: iptv
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: get-air/video
+          repository: air-tv/video
           ref: ${{ env.AIR_VIDEO_REF }}
           path: video
       - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
@@ -75,17 +75,17 @@ jobs:
           path: air
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: get-air/stremio-addon-client
+          repository: air-tv/stremio-addon-client
           ref: ${{ env.AIR_STREMIO_REF }}
           path: stremio-addon-client
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: get-air/iptv
+          repository: air-tv/iptv
           ref: ${{ env.AIR_IPTV_REF }}
           path: iptv
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: get-air/video
+          repository: air-tv/video
           ref: ${{ env.AIR_VIDEO_REF }}
           path: video
       - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
@@ -120,17 +120,17 @@ jobs:
           path: air
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: get-air/stremio-addon-client
+          repository: air-tv/stremio-addon-client
           ref: ${{ env.AIR_STREMIO_REF }}
           path: stremio-addon-client
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: get-air/iptv
+          repository: air-tv/iptv
           ref: ${{ env.AIR_IPTV_REF }}
           path: iptv
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: get-air/video
+          repository: air-tv/video
           ref: ${{ env.AIR_VIDEO_REF }}
           path: video
       - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
@@ -214,17 +214,17 @@ jobs:
           path: air
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: get-air/stremio-addon-client
+          repository: air-tv/stremio-addon-client
           ref: ${{ env.AIR_STREMIO_REF }}
           path: stremio-addon-client
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: get-air/iptv
+          repository: air-tv/iptv
           ref: ${{ env.AIR_IPTV_REF }}
           path: iptv
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: get-air/video
+          repository: air-tv/video
           ref: ${{ env.AIR_VIDEO_REF }}
           path: video
       - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
@@ -255,17 +255,17 @@ jobs:
           path: air
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: get-air/stremio-addon-client
+          repository: air-tv/stremio-addon-client
           ref: ${{ env.AIR_STREMIO_REF }}
           path: stremio-addon-client
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: get-air/iptv
+          repository: air-tv/iptv
           ref: ${{ env.AIR_IPTV_REF }}
           path: iptv
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: get-air/video
+          repository: air-tv/video
           ref: ${{ env.AIR_VIDEO_REF }}
           path: video
       - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
@@ -287,17 +287,17 @@ jobs:
           path: air
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: get-air/stremio-addon-client
+          repository: air-tv/stremio-addon-client
           ref: ${{ env.AIR_STREMIO_REF }}
           path: stremio-addon-client
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: get-air/iptv
+          repository: air-tv/iptv
           ref: ${{ env.AIR_IPTV_REF }}
           path: iptv
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: get-air/video
+          repository: air-tv/video
           ref: ${{ env.AIR_VIDEO_REF }}
           path: video
       - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
@@ -331,17 +331,17 @@ jobs:
           path: air
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: get-air/stremio-addon-client
+          repository: air-tv/stremio-addon-client
           ref: ${{ env.AIR_STREMIO_REF }}
           path: stremio-addon-client
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: get-air/iptv
+          repository: air-tv/iptv
           ref: ${{ env.AIR_IPTV_REF }}
           path: iptv
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: get-air/video
+          repository: air-tv/video
           ref: ${{ env.AIR_VIDEO_REF }}
           path: video
       - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
