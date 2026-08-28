@@ -1,6 +1,6 @@
 # ADR-0001: Durable source catalog and EPG storage
 
-- Status: Accepted architecture; dependency introduction deferred to the implementation gate
+- Status: Accepted and implemented; performance and physical-device gates remain open
 - Date: 2026-08-28
 - Owners: Air application core
 
@@ -255,3 +255,26 @@ WAL is enabled only for a runtime SQLite known to include the 3.51.3 fix or a
 documented vendor backport, and only after the connection/checkpoint test passes.
 Otherwise the store uses serialized writes with the rollback journal. This is
 an internal driver decision and never changes the common contract.
+
+### Browser implementation checkpoint (2026-08-28)
+
+JS and WasmJS now implement the common store directly on IndexedDB without a
+SQLite Wasm runtime. Source state, generation records, catalog identities,
+ordered catalog indexes, channel identities, ordered channel indexes, EPG
+programmes, bounded counters, and an orphan queue are separate object-store
+concerns. Catalog and channel ordering use native secondary indexes; catalog,
+guide, and cleanup reads use bounded cursors.
+
+Refresh allocation, batch staging, exact-count activation, deletion, and prune
+steps each run in short native read/write transactions. A failed, cancelled,
+quota-exhausted, or abandoned stage cannot move the active-generation pointer.
+The coroutine bridge requests `IDBTransaction.abort()` on cancellation; a
+transaction already committed before the cancellation signal remains committed
+and is either active or an unreachable cleanup candidate.
+
+The same deterministic contract fixture passed Kotlin/JS and Kotlin/WasmJS in
+Chromium 151 through Karma's real `ChromeHeadless` launcher. That proves the
+two compiled browser artifacts execute native IndexedDB transactions and
+cursors; it is not Firefox or Safari evidence. Safari private browsing, quota
+policy, eviction, and multi-tab version-upgrade behavior remain explicit
+browser-matrix risks.

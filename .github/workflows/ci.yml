@@ -33,7 +33,13 @@ jobs:
           ./gradlew
           verifyCommonMainAirCatalogDatabaseMigration
           assertJvmCatalogDependencies
-      - run: ./gradlew jvmTest jsNodeTest wasmJsNodeTest
+      - name: Run portable and real-browser contracts
+        run: >-
+          ./gradlew
+          jvmTest
+          jsNodeTest wasmJsNodeTest
+          jsBrowserTest wasmJsBrowserTest
+          --max-workers=2
 
   android:
     runs-on: ubuntu-latest
