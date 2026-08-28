@@ -223,28 +223,44 @@ class TvAuthController(
             return
         }
 
-        val pollingJob = commands.withLock {
-            if (closed || generation != ticket.generation || activeJob !== ticket.request) return@withLock null
-            if (now() >= authorization.expiresAt) {
-                activeJob = null
-                mutableState.value = TvAuthState.Failed(TvAuthFailure.DeviceAuthorizationExpired)
-                return@withLock null
-            }
+        val pollingJob = try {
+            commands.withLock {
+                if (closed || generation != ticket.generation || activeJob !== ticket.request) return@withLock null
+                if (now() >= authorization.expiresAt) {
+                    activeJob = null
+                    mutableState.value = TvAuthState.Failed(TvAuthFailure.DeviceAuthorizationExpired)
+                    return@withLock null
+                }
 
-            val attemptJob = SupervisorJob(lifecycleJob)
-            val attempt = DeviceAttempt(
-                generation = ticket.generation,
-                authorization = authorization,
-                job = attemptJob,
-                intervalSeconds = authorization.pollIntervalSeconds,
-                nextPollAt = now() + authorization.pollIntervalSeconds.seconds,
-            )
-            activeAttempt = attempt
-            activeJob = attemptJob
-            mutableState.value = TvAuthState.AwaitingDeviceApproval(authorization)
-            CoroutineScope(workerScope.coroutineContext + attemptJob).launch(start = CoroutineStart.LAZY) {
-                pollAutomatically(attempt, activeGateway)
+                val attemptJob = SupervisorJob(lifecycleJob)
+                val attempt = DeviceAttempt(
+                    generation = ticket.generation,
+                    authorization = authorization,
+                    job = attemptJob,
+                    intervalSeconds = authorization.pollIntervalSeconds,
+                    nextPollAt = now() + authorization.pollIntervalSeconds.seconds,
+                )
+                activeAttempt = attempt
+                activeJob = attemptJob
+                mutableState.value = TvAuthState.AwaitingDeviceApproval(authorization)
+                CoroutineScope(workerScope.coroutineContext + attemptJob).launch(start = CoroutineStart.LAZY) {
+                    try {
+                        pollAutomatically(attempt, activeGateway)
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (_: Throwable) {
+                        withContext(NonCancellable) {
+                            finish(
+                                attempt,
+                                TvAuthState.Failed(TvAuthFailure.DeviceAuthorizationNetworkUnavailable),
+                            )
+                        }
+                    }
+                }
             }
+        } catch (error: CancellationException) {
+            withContext(NonCancellable) { clearCancelledStart(ticket.generation) }
+            throw error
         }
         pollingJob?.start()
     }
@@ -300,11 +316,16 @@ class TvAuthController(
             return
         }
 
-        commands.withLock {
-            if (!closed && generation == ticket.generation && activeJob === ticket.request) {
-                activeJob = null
-                mutableState.value = TvAuthState.SignedIn(account)
+        try {
+            commands.withLock {
+                if (!closed && generation == ticket.generation && activeJob === ticket.request) {
+                    activeJob = null
+                    mutableState.value = TvAuthState.SignedIn(account)
+                }
             }
+        } catch (error: CancellationException) {
+            withContext(NonCancellable) { clearCancelledStart(ticket.generation) }
+            throw error
         }
     }
 

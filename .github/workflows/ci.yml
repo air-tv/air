@@ -116,9 +116,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes libsqlite3-dev
-          sqlite_library="$(cc -print-file-name=libsqlite3.so)"
+          sqlite_library="$(cc -print-file-name=libsqlite3.a)"
           test -f "$sqlite_library"
-          echo "AIR_SQLITE_LIBRARY_DIR=$(dirname "$sqlite_library")" >> "$GITHUB_ENV"
+          sqlite_static_dir="$RUNNER_TEMP/air-sqlite-static"
+          mkdir -p "$sqlite_static_dir"
+          cp "$sqlite_library" "$sqlite_static_dir/libsqlite3.a"
+          echo "AIR_SQLITE_LIBRARY_DIR=$sqlite_static_dir" >> "$GITHUB_ENV"
       - name: Install Windows SQLite development library
         if: runner.os == 'Windows'
         shell: pwsh
@@ -127,4 +130,5 @@ jobs:
           $sqliteLibrary = 'C:\msys64\mingw64\lib\libsqlite3.dll.a'
           if (-not (Test-Path $sqliteLibrary)) { throw 'MSYS2 SQLite import library is missing' }
           "AIR_SQLITE_LIBRARY_DIR=C:/msys64/mingw64/lib" >> $env:GITHUB_ENV
+          "C:\msys64\mingw64\bin" >> $env:GITHUB_PATH
       - run: ./gradlew ${{ matrix.tasks }}

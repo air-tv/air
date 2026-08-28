@@ -21,7 +21,13 @@ kotlin {
     linuxX64 {
         providers.environmentVariable("AIR_SQLITE_LIBRARY_DIR").orNull?.let { sqliteLibraryDirectory ->
             binaries.all {
-                linkerOpts("-L$sqliteLibraryDirectory")
+                linkerOpts(
+                    "-L$sqliteLibraryDirectory",
+                    "-lsqlite3",
+                    "-ldl",
+                    "-lpthread",
+                    "-lm",
+                )
             }
         }
     }
@@ -44,11 +50,6 @@ kotlin {
     wasmJs { browser(); nodejs() }
 
     sourceSets {
-        val webMain by creating {
-            dependsOn(commonMain.get())
-        }
-        jsMain.get().dependsOn(webMain)
-        wasmJsMain.get().dependsOn(webMain)
         val nativeMain by creating {
             dependsOn(commonMain.get())
             dependencies { implementation(libs.sqldelight.native.driver) }
@@ -95,6 +96,77 @@ kotlin {
         }
     }
 }
+
+val indexedDbRuntimeSource = layout.projectDirectory.file(
+    "src/browserIndexedDb/AirIndexedDbRuntime.js",
+)
+val indexedDbEs5RuntimeSource = layout.projectDirectory.file(
+    "src/browserIndexedDb/es5/AirIndexedDbRuntime.js",
+)
+val generatedIndexedDbRoot = layout.buildDirectory.dir("generated/indexeddb")
+
+val generateIndexedDbInterop by tasks.registering {
+    description = "Embeds the audited IndexedDB runtime in the JS and WasmJS artifacts."
+    notCompatibleWithConfigurationCache("Reads and embeds a JavaScript source artifact")
+    inputs.file(indexedDbRuntimeSource)
+    inputs.file(indexedDbEs5RuntimeSource)
+    outputs.dir(generatedIndexedDbRoot)
+    doLast {
+        val expression = indexedDbRuntimeSource.asFile.readText().trim()
+        val es5Expression = indexedDbEs5RuntimeSource.asFile.readText().trim().removeSuffix(";")
+        require("\"\"\"" !in expression && "\"\"\"" !in es5Expression) {
+            "IndexedDB runtime cannot contain a Kotlin triple quote"
+        }
+        val packagePath = "com/getair/core/catalog"
+        val jsFile = generatedIndexedDbRoot.get().file(
+            "jsMain/kotlin/$packagePath/GeneratedIndexedDbInterop.kt",
+        ).asFile
+        val wasmFile = generatedIndexedDbRoot.get().file(
+            "wasmJsMain/kotlin/$packagePath/GeneratedIndexedDbInterop.kt",
+        ).asFile
+        jsFile.parentFile.mkdirs()
+        wasmFile.parentFile.mkdirs()
+        val tripleQuote = "\"\"\""
+        jsFile.writeText(
+            "package com.getair.core.catalog\n\n" +
+                "import kotlin.js.Promise\n\n" +
+                "@Suppress(\"UNUSED_PARAMETER\")\n" +
+                "internal fun executeIndexedDbCommandRaw(\n" +
+                "    databaseName: String,\n" +
+                "    commandJson: String,\n" +
+                "): Promise<String> = js(" + tripleQuote + "(" + es5Expression +
+                ")(databaseName, commandJson)" + tripleQuote + ")\n",
+        )
+        wasmFile.writeText(
+            "package com.getair.core.catalog\n\n" +
+                "import kotlin.js.JsString\n" +
+                "import kotlin.js.Promise\n" +
+                "import kotlin.js.toJsString\n\n" +
+                "@JsFun(" + tripleQuote + expression + tripleQuote + ")\n" +
+                "private external fun executeIndexedDbCommandRawExternal(\n" +
+                "    databaseName: JsString,\n" +
+                "    commandJson: JsString,\n" +
+                "): Promise<JsString>\n\n" +
+                "internal fun executeIndexedDbCommandRaw(\n" +
+                "    databaseName: String,\n" +
+                "    commandJson: String,\n" +
+                "): Promise<JsString> = executeIndexedDbCommandRawExternal(\n" +
+                "    databaseName.toJsString(),\n" +
+                "    commandJson.toJsString(),\n" +
+                ")\n",
+        )
+    }
+}
+
+kotlin.sourceSets.named("jsMain").get().kotlin.srcDir(
+    generatedIndexedDbRoot.map { it.dir("jsMain/kotlin") },
+)
+kotlin.sourceSets.named("wasmJsMain").get().kotlin.srcDir(
+    generatedIndexedDbRoot.map { it.dir("wasmJsMain/kotlin") },
+)
+
+tasks.matching { it.name == "compileKotlinJs" || it.name == "compileKotlinWasmJs" }
+    .configureEach { dependsOn(generateIndexedDbInterop) }
 
 sqldelight {
     databases {
