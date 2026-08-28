@@ -618,6 +618,7 @@ private fun result(
 
 private fun safeArtwork(value: String?): String? {
     val candidate = value?.trim()?.takeIf(String::isNotEmpty) ?: return null
+    if (candidate.length > DurableGuideLimits.MAX_ARTWORK_REFERENCE_CHARS) return null
     val lower = candidate.lowercase()
     if ((!lower.startsWith("https://") && !lower.startsWith("http://")) || '?' in lower || '#' in lower) return null
     val scheme = lower.indexOf("://")

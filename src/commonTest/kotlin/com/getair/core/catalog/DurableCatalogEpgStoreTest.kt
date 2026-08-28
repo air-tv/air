@@ -33,6 +33,34 @@ import kotlin.test.assertTrue
 
 class DurableCatalogEpgStoreTest {
     @Test
+    fun oversizedArtworkIsDroppedWithoutFailingTheGuideRefresh() = runTest {
+        val adapter = DurableCatalogEpgStore(GuideOnlyCatalogStore(ContractInMemoryDurableGuideStore()))
+        val guide = guide("art-source", "art-feed")
+        val channelId = EpgChannelId("art-channel")
+        val oversized = "https://images.example.test/" +
+            "x".repeat(DurableGuideLimits.MAX_ARTWORK_REFERENCE_CHARS)
+        val refresh = adapter.refresh(
+            guide,
+            flowOf(
+                EpgBatch(
+                    channels = listOf(EpgChannel(channelId, listOf("Art"), iconUrl = oversized)),
+                    programmes = listOf(
+                        programme(channelId, 1_000, 2_000, "Art programme").copy(iconUrl = oversized),
+                    ),
+                    totalChannels = 1,
+                    totalProgrammes = 1,
+                ),
+            ),
+            instant(1_500),
+        )
+
+        assertTrue(refresh.committed)
+        val window = adapter.visibleWindow(guide, listOf(channelId), instant(0), instant(3_000))
+        assertNull(window.channels.single().channel?.iconUrl)
+        assertNull(window.channels.single().programmes.single().iconUrl)
+    }
+
+    @Test
     fun refreshProjectionQueriesMatchingIsolationAndReopen() = runTest {
         val backend = ContractInMemoryDurableGuideStore()
         val catalog = GuideOnlyCatalogStore(backend)
