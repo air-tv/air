@@ -11,6 +11,22 @@ import kotlin.test.assertNull
 
 class LocalSourcesTest {
     @Test
+    fun keepsMultiplePlaylistsIndependent() = runTest {
+        val registry = LocalSourceRegistry(InMemoryLocalSourceStore(), InMemoryLocalSourceSecretStore())
+        val news = LocalSourceProfile(LocalSourceId("news"), "News", LocalSourceKind.M3u)
+        val sports = LocalSourceProfile(LocalSourceId("sports"), "Sports", LocalSourceKind.M3u)
+
+        registry.upsert(news, M3uSourceSecret("https://news.invalid/list.m3u"))
+        registry.upsert(sports, M3uSourceSecret("https://sports.invalid/list.m3u"))
+        registry.setEnabled(news.id, false)
+
+        assertEquals(listOf(news.id, sports.id), registry.state.value.profiles.map(LocalSourceProfile::id))
+        assertFalse(registry.state.value.profiles.first { it.id == news.id }.enabled)
+        assertIs<M3uSourceSecret>(registry.secret(news.id))
+        assertIs<M3uSourceSecret>(registry.secret(sports.id))
+    }
+
+    @Test
     fun keepsExactCredentialsInARequiredLocalVault() = runTest {
         val vault = InMemoryLocalSourceSecretStore()
         val registry = LocalSourceRegistry(InMemoryLocalSourceStore(), vault)

@@ -49,14 +49,17 @@ class WindowsDpapiLocalSourceSecretStoreTest {
             store.write(id, secret)
             val persisted = Files.list(directory).use { files -> files.findFirst().orElseThrow() }
             val ciphertext = Files.readAllBytes(persisted).toString(Charsets.ISO_8859_1)
-            assertFalse("addon.invalid" in ciphertext)
-            assertFalse("synthetic-secret" in ciphertext)
+            assertFalse("addon.invalid" in ciphertext, "DPAPI ciphertext retained the synthetic URL")
+            assertFalse("synthetic-secret" in ciphertext, "DPAPI ciphertext retained the synthetic header")
             val reopened = WindowsDpapiLocalSourceSecretStore(directory)
-            val restored = assertIs<StremioAddonSourceSecret>(reopened.read(id))
-            assertEquals(secret.manifestUrl, restored.manifestUrl)
-            assertEquals(secret.headers, restored.headers)
+            val restored = assertIs<StremioAddonSourceSecret>(
+                reopened.read(id),
+                "DPAPI read did not restore the expected credential kind",
+            )
+            assertEquals(secret.manifestUrl, restored.manifestUrl, "DPAPI URL did not round-trip")
+            assertEquals(secret.headers, restored.headers, "DPAPI headers did not round-trip")
             reopened.remove(id)
-            assertNull(reopened.read(id))
+            assertNull(reopened.read(id), "DPAPI removal left a readable credential")
         } finally {
             directory.toFile().deleteRecursively()
         }
