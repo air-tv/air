@@ -113,5 +113,10 @@ jobs:
           java-version: "17"
       - name: Install Linux SQLite development library
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install --yes libsqlite3-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libsqlite3-dev
+          sqlite_library="$(cc -print-file-name=libsqlite3.so)"
+          test -f "$sqlite_library"
+          echo "AIR_SQLITE_LIBRARY_DIR=$(dirname "$sqlite_library")" >> "$GITHUB_ENV"
       - run: ./gradlew ${{ matrix.tasks }}

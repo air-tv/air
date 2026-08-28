@@ -18,7 +18,13 @@ kotlin {
     jvmToolchain(17)
     androidTarget { compilerOptions.jvmTarget.set(JvmTarget.JVM_17) }
     jvm { compilerOptions.jvmTarget.set(JvmTarget.JVM_17) }
-    linuxX64()
+    linuxX64 {
+        providers.environmentVariable("AIR_SQLITE_LIBRARY_DIR").orNull?.let { sqliteLibraryDirectory ->
+            binaries.all {
+                linkerOpts("-L$sqliteLibraryDirectory")
+            }
+        }
+    }
     mingwX64 {
         compilations.getByName("main") {
             cinterops.create("wincred")
@@ -33,6 +39,36 @@ kotlin {
     wasmJs { browser(); nodejs() }
 
     sourceSets {
+        val webMain by creating {
+            dependsOn(commonMain.get())
+        }
+        jsMain.get().dependsOn(webMain)
+        wasmJsMain.get().dependsOn(webMain)
+        val nativeMain by creating {
+            dependsOn(commonMain.get())
+            dependencies { implementation(libs.sqldelight.native.driver) }
+        }
+        val nativeTest by creating {
+            dependsOn(commonTest.get())
+        }
+        listOf(
+            linuxX64Main,
+            mingwX64Main,
+            macosX64Main,
+            macosArm64Main,
+            iosX64Main,
+            iosArm64Main,
+            iosSimulatorArm64Main,
+        ).forEach { it.get().dependsOn(nativeMain) }
+        listOf(
+            linuxX64Test,
+            mingwX64Test,
+            macosX64Test,
+            macosArm64Test,
+            iosX64Test,
+            iosArm64Test,
+            iosSimulatorArm64Test,
+        ).forEach { it.get().dependsOn(nativeTest) }
         commonMain.dependencies {
             api(libs.getair.iptv)
             api(libs.getair.stremio)
@@ -52,7 +88,6 @@ kotlin {
             implementation(libs.sqldelight.sqlite.driver)
             runtimeOnly(libs.sqlite.jdbc)
         }
-        nativeMain.dependencies { implementation(libs.sqldelight.native.driver) }
     }
 }
 
