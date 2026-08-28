@@ -2,7 +2,9 @@ package com.getair.core.catalog
 
 import kotlinx.datetime.Instant
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
@@ -144,13 +146,175 @@ internal suspend fun verifyIndexedDbGuideStartupCleanup(
     }
 }
 
+internal suspend fun verifyIndexedDbGuideReviewRegressions(
+    databaseName: String,
+    open: suspend (String, () -> Long) -> DurableCatalogStore,
+) {
+    var nowMillis = 3_000_000L
+    val catalog = open(databaseName) { nowMillis }
+    val store = catalog.guides
+    try {
+        val source = DurableGuideSourceKey("e".repeat(DurableGuideLimits.OPAQUE_DIGEST_CHARS))
+        val channelA = DurableGuideChannelKey("f".repeat(DurableGuideLimits.OPAQUE_DIGEST_CHARS))
+        val channelB = DurableGuideChannelKey("1".repeat(DurableGuideLimits.OPAQUE_DIGEST_CHARS))
+        val emptyChannel = DurableGuideChannelKey("2".repeat(DurableGuideLimits.OPAQUE_DIGEST_CHARS))
+        val retention = DurableGuideRetention(
+            Instant.fromEpochMilliseconds(500_000),
+            Instant.fromEpochMilliseconds(0),
+            Instant.fromEpochMilliseconds(1_000_000),
+        )
+
+        // Source deletion and revival fence every writer token from the old source epoch.
+        val fencedKey = DurableGuideKey(source, DurableGuideFeedId("fenced"))
+        val fenced = store.beginRefresh(fencedKey, retention)
+        store.stage(
+            fenced,
+            listOf(DurableGuideChannelRecord(channelA, listOf("Fenced"))),
+            listOf(programme(channelA, 1_000, "fenced")),
+        )
+        assertIs<DurableGuideSourceDeleteResult.Deleted>(
+            store.deleteSource(source, store.sourceSnapshot(source).token),
+        )
+        assertFalse(store.renewGeneration(fenced))
+        assertFailsWith<DurableGuideStoreException.Stale> { store.stage(fenced) }
+        assertIs<DurableGuideActivation.Superseded>(store.activate(fenced, DurableGuideCounts(1, 1)))
+        val revived = store.beginRefresh(fencedKey, retention)
+        assertFalse(store.renewGeneration(fenced))
+        assertFailsWith<DurableGuideStoreException.Stale> { store.stage(fenced) }
+        assertTrue(store.abandon(revived))
+
+        // Oversized batches poison without serializing their records; retention rejection is non-poisoning.
+        val oversized = store.beginRefresh(
+            DurableGuideKey(source, DurableGuideFeedId("oversized-regression")),
+            retention,
+        )
+        assertFailsWith<DurableGuideStoreException.Limit> {
+            store.stage(
+                oversized,
+                channels = List(DurableGuideLimits.MAX_BATCH_ITEMS + 1) {
+                    DurableGuideChannelRecord(channelA, listOf("Oversized"))
+                },
+            )
+        }
+        assertFalse(store.renewGeneration(oversized))
+        assertFailsWith<DurableGuideStoreException.Limit> {
+            store.activate(oversized, DurableGuideCounts(0, 0))
+        }
+        assertTrue(store.abandon(oversized))
+
+        val retentionWriter = store.beginRefresh(
+            DurableGuideKey(source, DurableGuideFeedId("retention-regression")),
+            retention,
+        )
+        assertFailsWith<IllegalArgumentException> {
+            store.stage(retentionWriter, programmes = listOf(programme(channelA, 1_000_000, "outside")))
+        }
+        assertTrue(store.renewGeneration(retentionWriter))
+        assertTrue(store.abandon(retentionWriter))
+
+        // Exhausted total rows keep later empty channels honest and never fetch one extra row.
+        val multiKey = DurableGuideKey(source, DurableGuideFeedId("multi-regression"))
+        val multiGeneration = store.beginRefresh(multiKey, retention)
+        store.stage(
+            multiGeneration,
+            channels = listOf(
+                DurableGuideChannelRecord(channelA, listOf("A")),
+                DurableGuideChannelRecord(channelB, listOf("B")),
+                DurableGuideChannelRecord(emptyChannel, listOf("Empty")),
+            ),
+            programmes = listOf(
+                programme(channelA, 100_000, "a"),
+                programme(channelB, 100_000, "b"),
+            ),
+        )
+        val multiSnapshot = (store.activate(multiGeneration, DurableGuideCounts(3, 2)) as
+            DurableGuideActivation.Published).snapshot
+        val multiLease = assertNotNull(store.acquire(multiSnapshot))
+        val multi = store.multiChannelWindow(
+            multiLease,
+            DurableGuideMultiChannelWindowRequest(
+                listOf(channelA, emptyChannel, channelB),
+                Instant.fromEpochMilliseconds(99_000),
+                Instant.fromEpochMilliseconds(102_000),
+                perChannelLimit = 1,
+                totalLimit = 1,
+            ),
+        )
+        assertEquals(listOf(1, 0, 0), multi.channels.map { it.programmes.size })
+        assertEquals(listOf(false, false, true), multi.channels.map { it.truncated })
+        store.release(multiLease)
+
+        // The finite-start index jumps over dense historic non-overlaps.
+        val windowKey = DurableGuideKey(source, DurableGuideFeedId("window-regression"))
+        val windowGeneration = store.beginRefresh(windowKey, retention)
+        store.stage(windowGeneration, channels = listOf(DurableGuideChannelRecord(channelA, listOf("Window"))))
+        repeat(3) { batch ->
+            store.stage(
+                windowGeneration,
+                programmes = List(200) { index ->
+                    val start = (batch * 200L + index) * 500L
+                    programme(channelA, start, "historic-$batch-$index", durationMillis = 100)
+                },
+            )
+        }
+        val windowSnapshot = (store.activate(windowGeneration, DurableGuideCounts(1, 600)) as
+            DurableGuideActivation.Published).snapshot
+        val windowLease = assertNotNull(store.acquire(windowSnapshot))
+        val emptyWindow = store.window(
+            windowLease,
+            channelA,
+            Instant.fromEpochMilliseconds(500_000),
+            Instant.fromEpochMilliseconds(501_000),
+            limit = 10,
+        )
+        assertTrue(emptyWindow.programmes.isEmpty())
+        assertFalse(emptyWindow.truncated)
+        store.release(windowLease)
+
+        // maxRows=1 consumes at most one expired lease or payload row per pass.
+        val cleanupKey = DurableGuideKey(source, DurableGuideFeedId("cleanup-regression"))
+        val cleanupGeneration = store.beginRefresh(cleanupKey, retention)
+        store.stage(
+            cleanupGeneration,
+            listOf(DurableGuideChannelRecord(channelA, listOf("Cleanup"))),
+            listOf(programme(channelA, 10_000, "cleanup-old")),
+        )
+        val cleanupSnapshot = (store.activate(cleanupGeneration, DurableGuideCounts(1, 1)) as
+            DurableGuideActivation.Published).snapshot
+        repeat(16) { assertNotNull(store.acquire(cleanupSnapshot)) }
+        val replacement = store.beginRefresh(cleanupKey, retention)
+        store.stage(
+            replacement,
+            listOf(DurableGuideChannelRecord(channelA, listOf("Cleanup replacement"))),
+            listOf(programme(channelA, 20_000, "cleanup-new")),
+        )
+        store.activate(replacement, DurableGuideCounts(1, 1))
+        nowMillis += store.leaseIdleTimeoutMillis + 1
+        var passes = 0
+        var removedPayloadRows = 0
+        var cleanup: DurableGuideCleanupResult
+        do {
+            cleanup = store.cleanupUnreachable(1)
+            assertTrue(cleanup.removedRows in 0..1)
+            removedPayloadRows += cleanup.removedRows
+            passes += 1
+        } while (cleanup.hasMore && passes < 64)
+        assertTrue(passes >= 18)
+        assertEquals(2, removedPayloadRows)
+        assertFalse(cleanup.hasMore)
+    } finally {
+        catalog.close()
+    }
+}
+
 private fun programme(
     channelKey: DurableGuideChannelKey,
     startMillis: Long,
     title: String,
+    durationMillis: Long = 1_000,
 ): DurableGuideProgrammeRecord = DurableGuideProgrammeRecord(
     channelKey = channelKey,
     start = Instant.fromEpochMilliseconds(startMillis),
-    end = Instant.fromEpochMilliseconds(startMillis + 1_000),
+    end = Instant.fromEpochMilliseconds(startMillis + durationMillis),
     title = title,
 )

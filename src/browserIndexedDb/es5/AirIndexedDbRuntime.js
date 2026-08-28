@@ -104,6 +104,8 @@
                             programmes.createIndex("endKey", "endKey", { unique: true });
                             programmes.createIndex("generationChannelStart", ["generationKey", "channelKey", "startMs"], { unique: true });
                             programmes.createIndex("generationChannelEffectiveEnd", ["generationKey", "channelKey", "effectiveEndMs", "startMs"], { unique: true });
+                            programmes.createIndex("generationChannelFiniteStart", ["generationKey", "channelKey", "finiteStartMs"], { unique: true });
+                            programmes.createIndex("generationChannelOpenStart", ["generationKey", "channelKey", "openStartMs"], { unique: true });
                             programmes.createIndex("generationLocator", ["generationKey", "key"], { unique: true });
                         }
                         if (!database.objectStoreNames.contains(STORE_1.guideLeases)) {
@@ -789,6 +791,9 @@
                                         retention: command.retention,
                                         channelPrefix: command.channelBase + component + "|",
                                         programmePrefix: command.programmeBase + component + "|",
+                                        finiteStartPrefix: command.finiteStartBase + component + "|",
+                                        openStartPrefix: command.openStartBase + component + "|",
+                                        maxFiniteSpanMs: 0,
                                         status: "staging",
                                         expiresAt: command.nowMs + command.generationIdleTimeoutMillis,
                                         batchCount: 0,
@@ -837,46 +842,100 @@
                             generationRequest.onerror = function () { return fail(classify_1(generationRequest.error)); };
                             generationRequest.onsuccess = function () {
                                 var generation = generationRequest.result;
-                                if (!generation || generation.status !== "staging") {
+                                var abandonablePoison = command.op === "guideAbandon" && generation && generation.status === "poisoned";
+                                if (!generation || (generation.status !== "staging" && !abandonablePoison)) {
                                     setResult({ status: "terminal", value: false });
                                     return;
                                 }
-                                var feedRequest = tx.objectStore(STORE_1.guideStates).get(generation.feedStateKey);
-                                feedRequest.onerror = function () { return fail(classify_1(feedRequest.error)); };
-                                feedRequest.onsuccess = function () {
-                                    var feed = feedRequest.result;
-                                    if (!feed || feed.latestGeneration !== generation.generation || generation.expiresAt <= command.nowMs) {
+                                var states = tx.objectStore(STORE_1.guideStates);
+                                var sourceRequest = states.get(generation.sourceStateKey);
+                                sourceRequest.onerror = function () { return fail(classify_1(sourceRequest.error)); };
+                                sourceRequest.onsuccess = function () {
+                                    var source = sourceRequest.result;
+                                    if (!source || source.deleted || source.epoch !== generation.sourceEpoch) {
                                         setResult({ status: "terminal", value: false });
                                         return;
                                     }
-                                    if (command.op === "guideRenewGeneration") {
-                                        generation.expiresAt = command.nowMs + command.generationIdleTimeoutMillis;
-                                        tx.objectStore(STORE_1.guideGenerations).put(generation);
-                                        guideQueuePut_1(tx, generation.key, generation.expiresAt);
-                                        setResult({ status: "ok", value: true });
-                                    }
-                                    else {
-                                        var sourceRequest_1 = tx.objectStore(STORE_1.guideStates).get(generation.sourceStateKey);
-                                        sourceRequest_1.onerror = function () { return fail(classify_1(sourceRequest_1.error)); };
-                                        sourceRequest_1.onsuccess = function () {
-                                            var source = sourceRequest_1.result;
+                                    var feedRequest = states.get(generation.feedStateKey);
+                                    feedRequest.onerror = function () { return fail(classify_1(feedRequest.error)); };
+                                    feedRequest.onsuccess = function () {
+                                        var feed = feedRequest.result;
+                                        if (!feed || feed.sourceEpoch !== generation.sourceEpoch ||
+                                            feed.latestGeneration !== generation.generation ||
+                                            (generation.status === "staging" && generation.expiresAt <= command.nowMs)) {
+                                            setResult({ status: "terminal", value: false });
+                                            return;
+                                        }
+                                        if (command.op === "guideRenewGeneration") {
+                                            generation.expiresAt = command.nowMs + command.generationIdleTimeoutMillis;
+                                            tx.objectStore(STORE_1.guideGenerations).put(generation);
+                                            guideQueuePut_1(tx, generation.key, generation.expiresAt);
+                                            setResult({ status: "ok", value: true });
+                                        }
+                                        else {
                                             generation.status = "abandoned";
                                             generation.expiresAt = 0;
                                             feed.latestGeneration = null;
                                             feed.mutation += 1;
-                                            if (source && !source.deleted && source.epoch === generation.sourceEpoch) {
-                                                if (feed.activeGeneration === null) {
-                                                    source.stagedOnlyFeedCount = Math.max(0, source.stagedOnlyFeedCount - 1);
-                                                }
-                                                source.mutation += 1;
-                                                tx.objectStore(STORE_1.guideStates).put(source);
+                                            if (feed.activeGeneration === null) {
+                                                source.stagedOnlyFeedCount = Math.max(0, source.stagedOnlyFeedCount - 1);
                                             }
-                                            tx.objectStore(STORE_1.guideStates).put(feed);
+                                            source.mutation += 1;
+                                            states.put(source);
+                                            states.put(feed);
                                             tx.objectStore(STORE_1.guideGenerations).put(generation);
                                             guideQueuePut_1(tx, generation.key, 0);
                                             setResult({ status: "ok", value: true });
-                                        };
+                                        }
+                                    };
+                                };
+                            };
+                        });
+                    case "guideRejectStage":
+                        return transaction_1(database, [STORE_1.guideStates, STORE_1.guideGenerations, STORE_1.guideCleanupQueue], "readwrite", command.operationId, function (tx, setResult, fail) {
+                            var generations = tx.objectStore(STORE_1.guideGenerations);
+                            var request = generations.get(command.generationKey);
+                            request.onerror = function () { return fail(classify_1(request.error)); };
+                            request.onsuccess = function () {
+                                var generation = request.result;
+                                if (!generation) {
+                                    setResult({ status: "stale" });
+                                    return;
+                                }
+                                if (generation.status === "poisoned") {
+                                    setResult({ status: "limit" });
+                                    return;
+                                }
+                                if (generation.status !== "staging" || generation.expiresAt <= command.nowMs) {
+                                    setResult({ status: "stale" });
+                                    return;
+                                }
+                                var states = tx.objectStore(STORE_1.guideStates);
+                                var sourceRequest = states.get(generation.sourceStateKey);
+                                sourceRequest.onerror = function () { return fail(classify_1(sourceRequest.error)); };
+                                sourceRequest.onsuccess = function () {
+                                    var source = sourceRequest.result;
+                                    if (!source || source.deleted || source.epoch !== generation.sourceEpoch) {
+                                        setResult({ status: "stale" });
+                                        return;
                                     }
+                                    var feedRequest = states.get(generation.feedStateKey);
+                                    feedRequest.onerror = function () { return fail(classify_1(feedRequest.error)); };
+                                    feedRequest.onsuccess = function () {
+                                        var feed = feedRequest.result;
+                                        if (!feed || feed.sourceEpoch !== generation.sourceEpoch || feed.latestGeneration !== generation.generation) {
+                                            setResult({ status: "stale" });
+                                            return;
+                                        }
+                                        generation.batchCount += 1;
+                                        generation.inputChannelRows += command.inputChannelRows;
+                                        generation.inputProgrammeRows += command.inputProgrammeRows;
+                                        generation.status = "poisoned";
+                                        generation.expiresAt = 0;
+                                        generations.put(generation);
+                                        guideQueuePut_1(tx, generation.key, 0);
+                                        setResult({ status: "limit" });
+                                    };
                                 };
                             };
                         });
@@ -887,99 +946,118 @@
                             generationRequest.onerror = function () { return fail(classify_1(generationRequest.error)); };
                             generationRequest.onsuccess = function () {
                                 var generation = generationRequest.result;
+                                if (generation && generation.status === "poisoned") {
+                                    setResult({ status: "limit" });
+                                    return;
+                                }
                                 if (!generation || generation.status !== "staging" || generation.expiresAt <= command.nowMs) {
                                     setResult({ status: "stale" });
                                     return;
                                 }
-                                var feedRequest = tx.objectStore(STORE_1.guideStates).get(generation.feedStateKey);
-                                feedRequest.onerror = function () { return fail(classify_1(feedRequest.error)); };
-                                feedRequest.onsuccess = function () {
-                                    var feed = feedRequest.result;
-                                    if (!feed || feed.latestGeneration !== generation.generation) {
+                                var states = tx.objectStore(STORE_1.guideStates);
+                                var sourceRequest = states.get(generation.sourceStateKey);
+                                sourceRequest.onerror = function () { return fail(classify_1(sourceRequest.error)); };
+                                sourceRequest.onsuccess = function () {
+                                    var source = sourceRequest.result;
+                                    if (!source || source.deleted || source.epoch !== generation.sourceEpoch) {
                                         setResult({ status: "stale" });
                                         return;
                                     }
-                                    var batchItems = command.channels.length + command.programmes.length;
-                                    if (batchItems > command.maxBatchItems && generation.batchCount === 0) {
-                                        setResult({ status: "limit" });
-                                        return;
-                                    }
-                                    generation.batchCount += 1;
-                                    generation.inputChannelRows += command.channels.length;
-                                    generation.inputProgrammeRows += command.programmes.length;
-                                    if (generation.batchCount > command.maxBatches ||
-                                        generation.inputChannelRows > command.maxInputChannels ||
-                                        generation.inputProgrammeRows > command.maxInputProgrammes ||
-                                        batchItems > command.maxBatchItems) {
-                                        generation.status = "poisoned";
-                                        generation.expiresAt = 0;
-                                        generations.put(generation);
-                                        guideQueuePut_1(tx, generation.key, 0);
-                                        setResult({ status: "limit" });
-                                        return;
-                                    }
-                                    var channelsStore = tx.objectStore(STORE_1.guideChannels);
-                                    var programmesStore = tx.objectStore(STORE_1.guideProgrammes);
-                                    var channelUpdates = [];
-                                    var programmeUpdates = [];
-                                    var pending = command.channels.length + command.programmes.length;
-                                    var addedChannels = 0;
-                                    var addedProgrammes = 0;
-                                    var complete = function () {
-                                        if (pending !== 0)
+                                    var feedRequest = states.get(generation.feedStateKey);
+                                    feedRequest.onerror = function () { return fail(classify_1(feedRequest.error)); };
+                                    feedRequest.onsuccess = function () {
+                                        var feed = feedRequest.result;
+                                        if (!feed || feed.latestGeneration !== generation.generation) {
+                                            setResult({ status: "stale" });
                                             return;
-                                        var channelCount = generation.channelCount + addedChannels;
-                                        var programmeCount = generation.programmeCount + addedProgrammes;
-                                        if (channelCount > command.maxChannels || programmeCount > command.maxProgrammes) {
+                                        }
+                                        var batchItems = command.channels.length + command.programmes.length;
+                                        generation.batchCount += 1;
+                                        generation.inputChannelRows += command.channels.length;
+                                        generation.inputProgrammeRows += command.programmes.length;
+                                        if (generation.batchCount > command.maxBatches ||
+                                            generation.inputChannelRows > command.maxInputChannels ||
+                                            generation.inputProgrammeRows > command.maxInputProgrammes ||
+                                            batchItems > command.maxBatchItems) {
+                                            generation.status = "poisoned";
+                                            generation.expiresAt = 0;
                                             generations.put(generation);
+                                            guideQueuePut_1(tx, generation.key, 0);
                                             setResult({ status: "limit" });
                                             return;
                                         }
-                                        channelUpdates.forEach(function (row) { return channelsStore.put(row); });
-                                        programmeUpdates.forEach(function (row) { return programmesStore.put(row); });
-                                        generation.channelCount = channelCount;
-                                        generation.programmeCount = programmeCount;
-                                        generation.expiresAt = command.nowMs + command.generationIdleTimeoutMillis;
-                                        generations.put(generation);
-                                        guideQueuePut_1(tx, generation.key, generation.expiresAt);
-                                        setResult({ status: "ok", counts: { channels: channelCount, programmes: programmeCount } });
+                                        var channelsStore = tx.objectStore(STORE_1.guideChannels);
+                                        var programmesStore = tx.objectStore(STORE_1.guideProgrammes);
+                                        var channelUpdates = [];
+                                        var programmeUpdates = [];
+                                        var pending = command.channels.length + command.programmes.length;
+                                        var addedChannels = 0;
+                                        var addedProgrammes = 0;
+                                        var complete = function () {
+                                            if (pending !== 0)
+                                                return;
+                                            var channelCount = generation.channelCount + addedChannels;
+                                            var programmeCount = generation.programmeCount + addedProgrammes;
+                                            if (channelCount > command.maxChannels || programmeCount > command.maxProgrammes) {
+                                                generation.status = "poisoned";
+                                                generation.expiresAt = 0;
+                                                generations.put(generation);
+                                                guideQueuePut_1(tx, generation.key, 0);
+                                                setResult({ status: "limit" });
+                                                return;
+                                            }
+                                            channelUpdates.forEach(function (row) { return channelsStore.put(row); });
+                                            programmeUpdates.forEach(function (row) { return programmesStore.put(row); });
+                                            generation.channelCount = channelCount;
+                                            generation.programmeCount = programmeCount;
+                                            generation.expiresAt = command.nowMs + command.generationIdleTimeoutMillis;
+                                            generations.put(generation);
+                                            guideQueuePut_1(tx, generation.key, generation.expiresAt);
+                                            setResult({ status: "ok", counts: { channels: channelCount, programmes: programmeCount } });
+                                        };
+                                        if (pending === 0)
+                                            complete();
+                                        command.channels.forEach(function (candidate) {
+                                            candidate.sourceKey = generation.sourceKey;
+                                            candidate.feedId = generation.feedId;
+                                            candidate.generation = generation.generation;
+                                            candidate.generationKey = generation.key;
+                                            var request = channelsStore.get(candidate.key);
+                                            request.onerror = function () { return fail(classify_1(request.error)); };
+                                            request.onsuccess = function () {
+                                                var current = request.result;
+                                                if (!current)
+                                                    addedChannels += 1;
+                                                if (!current || compareGuideChannels_1(candidate, current) < 0)
+                                                    channelUpdates.push(candidate);
+                                                pending -= 1;
+                                                complete();
+                                            };
+                                        });
+                                        command.programmes.forEach(function (candidate) {
+                                            candidate.sourceKey = generation.sourceKey;
+                                            candidate.feedId = generation.feedId;
+                                            candidate.generation = generation.generation;
+                                            candidate.generationKey = generation.key;
+                                            if (candidate.endMs === null)
+                                                candidate.openStartMs = candidate.startMs;
+                                            else {
+                                                candidate.finiteStartMs = candidate.startMs;
+                                                generation.maxFiniteSpanMs = Math.max(generation.maxFiniteSpanMs, candidate.effectiveEndMs - candidate.startMs);
+                                            }
+                                            var request = programmesStore.get(candidate.key);
+                                            request.onerror = function () { return fail(classify_1(request.error)); };
+                                            request.onsuccess = function () {
+                                                var current = request.result;
+                                                if (!current)
+                                                    addedProgrammes += 1;
+                                                if (!current || compareGuideProgrammes_1(candidate, current) < 0)
+                                                    programmeUpdates.push(candidate);
+                                                pending -= 1;
+                                                complete();
+                                            };
+                                        });
                                     };
-                                    if (pending === 0)
-                                        complete();
-                                    command.channels.forEach(function (candidate) {
-                                        candidate.sourceKey = generation.sourceKey;
-                                        candidate.feedId = generation.feedId;
-                                        candidate.generation = generation.generation;
-                                        candidate.generationKey = generation.key;
-                                        var request = channelsStore.get(candidate.key);
-                                        request.onerror = function () { return fail(classify_1(request.error)); };
-                                        request.onsuccess = function () {
-                                            var current = request.result;
-                                            if (!current)
-                                                addedChannels += 1;
-                                            if (!current || compareGuideChannels_1(candidate, current) < 0)
-                                                channelUpdates.push(candidate);
-                                            pending -= 1;
-                                            complete();
-                                        };
-                                    });
-                                    command.programmes.forEach(function (candidate) {
-                                        candidate.sourceKey = generation.sourceKey;
-                                        candidate.feedId = generation.feedId;
-                                        candidate.generation = generation.generation;
-                                        candidate.generationKey = generation.key;
-                                        var request = programmesStore.get(candidate.key);
-                                        request.onerror = function () { return fail(classify_1(request.error)); };
-                                        request.onsuccess = function () {
-                                            var current = request.result;
-                                            if (!current)
-                                                addedProgrammes += 1;
-                                            if (!current || compareGuideProgrammes_1(candidate, current) < 0)
-                                                programmeUpdates.push(candidate);
-                                            pending -= 1;
-                                            complete();
-                                        };
-                                    });
                                 };
                             };
                         });
@@ -1242,40 +1320,82 @@
                     case "durableGuideWindow":
                         return transaction_1(database, [STORE_1.guideLeases, STORE_1.guideGenerations, STORE_1.guideProgrammes], "readonly", command.operationId, function (tx, setResult, fail) {
                             guideLease_1(tx, command, function (_lease, generation) {
-                                var prefix = command.channelProgrammePrefix;
-                                var lower = command.afterKey === null ? prefix : command.afterKey;
-                                var upper = prefix + command.untilKey;
-                                var range = IDBKeyRange.bound(lower, upper, command.afterKey !== null, true);
+                                var store = tx.objectStore(STORE_1.guideProgrammes);
+                                var finiteIndex = store.index("generationChannelFiniteStart");
+                                var openIndex = store.index("generationChannelOpenStart");
+                                var finiteFloor = Math.max(generation.retention.retainedFromMs, command.fromMs - generation.maxFiniteSpanMs);
+                                var finiteLower = command.afterStartMs === null
+                                    ? finiteFloor
+                                    : Math.max(finiteFloor, command.afterStartMs);
+                                var openLower = command.afterStartMs === null
+                                    ? generation.retention.retainedFromMs
+                                    : Math.max(generation.retention.retainedFromMs, command.afterStartMs);
+                                var finiteRange = IDBKeyRange.bound([generation.key, command.channelKey, finiteLower], [generation.key, command.channelKey, command.untilMs], command.afterStartMs !== null && command.afterStartMs >= finiteFloor, true);
+                                var openRange = IDBKeyRange.bound([generation.key, command.channelKey, openLower], [generation.key, command.channelKey, command.untilMs], command.afterStartMs !== null && command.afterStartMs >= generation.retention.retainedFromMs, true);
                                 var rows = [];
                                 var payloadBytes = 0;
-                                var request = tx.objectStore(STORE_1.guideProgrammes).openCursor(range);
-                                request.onerror = function () { return fail(classify_1(request.error)); };
-                                request.onsuccess = function () {
-                                    var cursor = request.result;
-                                    if (!cursor) {
-                                        setResult({ status: "ok", rows: rows, nextKey: null, truncated: false, payloadBytes: payloadBytes });
+                                var visits = 0;
+                                var finiteCursor;
+                                var openCursor;
+                                var finiteReady = false;
+                                var openReady = false;
+                                var finish = function (truncated) { return setResult({
+                                    status: "ok",
+                                    rows: rows,
+                                    nextStartMs: truncated && rows.length > 0 ? rows[rows.length - 1].startMs : null,
+                                    truncated: truncated,
+                                    payloadBytes: payloadBytes,
+                                }); };
+                                var advance = function (kind, cursor) {
+                                    if (kind === "finite")
+                                        finiteReady = false;
+                                    else
+                                        openReady = false;
+                                    cursor.continue();
+                                };
+                                var pump = function () {
+                                    if (!finiteReady || !openReady)
+                                        return;
+                                    if (!finiteCursor && !openCursor) {
+                                        finish(false);
                                         return;
                                     }
+                                    var kind;
+                                    var cursor;
+                                    if (!openCursor || (finiteCursor && (finiteCursor.value.startMs < openCursor.value.startMs ||
+                                        (finiteCursor.value.startMs === openCursor.value.startMs && finiteCursor.primaryKey < openCursor.primaryKey)))) {
+                                        kind = "finite";
+                                        cursor = finiteCursor;
+                                    }
+                                    else {
+                                        kind = "open";
+                                        cursor = openCursor;
+                                    }
+                                    if (visits >= command.maxIndexVisits) {
+                                        setResult({ status: "limit" });
+                                        return;
+                                    }
+                                    visits += 1;
                                     var row = cursor.value;
                                     if (row.effectiveEndMs <= command.fromMs) {
-                                        cursor.continue();
+                                        advance(kind, cursor);
                                         return;
                                     }
                                     var bytes = guideProgrammeBytes_1(row);
                                     if (rows.length >= command.limit || payloadBytes + bytes > command.payloadByteLimit) {
-                                        setResult({
-                                            status: "ok",
-                                            rows: rows,
-                                            nextKey: rows.length === 0 ? command.afterKey : rows[rows.length - 1].cursorKey,
-                                            truncated: true,
-                                            payloadBytes: payloadBytes,
-                                        });
+                                        finish(true);
                                         return;
                                     }
-                                    rows.push(Object.assign({ cursorKey: cursor.key, locatorKey: cursor.key }, row));
+                                    rows.push(Object.assign({ locatorKey: cursor.primaryKey }, row));
                                     payloadBytes += bytes;
-                                    cursor.continue();
+                                    advance(kind, cursor);
                                 };
+                                var finiteRequest = finiteIndex.openCursor(finiteRange);
+                                finiteRequest.onerror = function () { return fail(classify_1(finiteRequest.error)); };
+                                finiteRequest.onsuccess = function () { finiteCursor = finiteRequest.result; finiteReady = true; pump(); };
+                                var openRequest = openIndex.openCursor(openRange);
+                                openRequest.onerror = function () { return fail(classify_1(openRequest.error)); };
+                                openRequest.onsuccess = function () { openCursor = openRequest.result; openReady = true; pump(); };
                             }, setResult, fail);
                         });
                     case "guideNowNext":
@@ -1344,6 +1464,10 @@
                                     var generations = tx.objectStore(STORE_1.guideGenerations);
                                     var allocate = function () {
                                         var generation = feed.nextGeneration;
+                                        if (!Number.isSafeInteger(generation) || generation <= 0) {
+                                            fail("AIR_IDB_GENERATION_EXHAUSTED");
+                                            return;
+                                        }
                                         var component = sortableKey_1(generation);
                                         var generationKey = command.generationPrefix + component;
                                         feed.nextGeneration = generation + 1;
@@ -1353,6 +1477,7 @@
                                         var row = {
                                             key: generationKey,
                                             sourceKey: command.sourceKey,
+                                            sourceStateKey: command.sourceStateKey,
                                             feedId: command.feedId,
                                             sourceEpoch: source.epoch,
                                             sourceEpochKey: command.sourceKey + "|" + sortableKey_1(source.epoch),
@@ -1362,6 +1487,9 @@
                                             retention: command.retention,
                                             channelPrefix: command.channelBase + component + "|",
                                             programmePrefix: command.programmeBase + component + "|",
+                                            finiteStartPrefix: command.finiteStartBase + component + "|",
+                                            openStartPrefix: command.openStartBase + component + "|",
+                                            maxFiniteSpanMs: 0,
                                             status: "staging",
                                             purpose: "prune",
                                             expiresAt: command.nowMs + command.generationIdleTimeoutMillis,
@@ -1418,13 +1546,22 @@
                                         setResult({ status: "superseded", current: guideSnapshot_1(feed) });
                                         return;
                                     }
-                                    generation.status = "abandoned";
-                                    generation.expiresAt = 0;
-                                    feed.latestGeneration = null;
-                                    generations.put(generation);
-                                    states.put(feed);
-                                    guideQueuePut_1(tx, generation.key, 0);
-                                    setResult({ status: "unchanged", current: guideSnapshot_1(feed) });
+                                    var sourceRequest = states.get(generation.sourceStateKey);
+                                    sourceRequest.onerror = function () { return fail(classify_1(sourceRequest.error)); };
+                                    sourceRequest.onsuccess = function () {
+                                        var source = sourceRequest.result;
+                                        if (!source || source.deleted || source.epoch !== generation.sourceEpoch) {
+                                            setResult({ status: "superseded", current: null });
+                                            return;
+                                        }
+                                        generation.status = "abandoned";
+                                        generation.expiresAt = 0;
+                                        feed.latestGeneration = null;
+                                        generations.put(generation);
+                                        states.put(feed);
+                                        guideQueuePut_1(tx, generation.key, 0);
+                                        setResult({ status: "unchanged", current: guideSnapshot_1(feed) });
+                                    };
                                 };
                             };
                         });
@@ -1525,12 +1662,12 @@
                             var queue = tx.objectStore(STORE_1.guideCleanupQueue);
                             var queueIndex = queue.index("cleanupAt");
                             var finish = function (removedRows) {
-                                var countRequest = queueIndex.count(IDBKeyRange.upperBound(command.nowMs));
-                                countRequest.onerror = function () { return fail(classify_1(countRequest.error)); };
-                                countRequest.onsuccess = function () { return setResult({
+                                var moreRequest = queueIndex.openKeyCursor(IDBKeyRange.upperBound(command.nowMs));
+                                moreRequest.onerror = function () { return fail(classify_1(moreRequest.error)); };
+                                moreRequest.onsuccess = function () { return setResult({
                                     status: "ok",
                                     removedRows: removedRows,
-                                    hasMore: countRequest.result > 0,
+                                    hasMore: moreRequest.result !== null,
                                 }); };
                             };
                             var processGeneration = function (generation, queueRow) {
@@ -1547,21 +1684,18 @@
                                 }
                                 var leases = tx.objectStore(STORE_1.guideLeases);
                                 var leaseRequest = leases.index("generationKey").openCursor(IDBKeyRange.only(generation.key));
-                                var liveLeaseExpiry = null;
                                 leaseRequest.onerror = function () { return fail(classify_1(leaseRequest.error)); };
                                 leaseRequest.onsuccess = function () {
                                     var cursor = leaseRequest.result;
                                     if (cursor) {
                                         var lease = cursor.value;
-                                        if (lease.expiresAt <= command.nowMs)
+                                        if (lease.expiresAt <= command.nowMs) {
                                             cursor.delete();
-                                        else
-                                            liveLeaseExpiry = liveLeaseExpiry === null ? lease.expiresAt : Math.min(liveLeaseExpiry, lease.expiresAt);
-                                        cursor.continue();
-                                        return;
-                                    }
-                                    if (liveLeaseExpiry !== null) {
-                                        queueRow.cleanupAt = liveLeaseExpiry;
+                                            queueRow.cleanupAt = 0;
+                                        }
+                                        else {
+                                            queueRow.cleanupAt = lease.expiresAt;
+                                        }
                                         queue.put(queueRow);
                                         finish(0);
                                         return;
@@ -1597,16 +1731,18 @@
                                         };
                                     };
                                     var checkEmpty = function () {
-                                        var channelsCount = tx.objectStore(STORE_1.guideChannels).count(rangeForPrefix_1(generation.channelPrefix));
-                                        var programmesCount = tx.objectStore(STORE_1.guideProgrammes).count(rangeForPrefix_1(generation.programmePrefix));
+                                        var channelsCount = tx.objectStore(STORE_1.guideChannels)
+                                            .openKeyCursor(rangeForPrefix_1(generation.channelPrefix));
+                                        var programmesCount = tx.objectStore(STORE_1.guideProgrammes)
+                                            .openKeyCursor(rangeForPrefix_1(generation.programmePrefix));
                                         var pending = 2;
-                                        var total = 0;
+                                        var hasPayload = false;
                                         var done = function (request) {
-                                            total += request.result;
+                                            hasPayload = hasPayload || request.result !== null;
                                             pending -= 1;
                                             if (pending !== 0)
                                                 return;
-                                            if (total === 0) {
+                                            if (!hasPayload) {
                                                 tx.objectStore(STORE_1.guideGenerations).delete(generation.key);
                                                 if (queueRow.kind === "source") {
                                                     queueRow.cleanupAt = 0;
@@ -1617,15 +1753,17 @@
                                                 }
                                                 var states_1 = tx.objectStore(STORE_1.guideStates);
                                                 var feedRequest_1 = states_1.get(generation.feedStateKey);
+                                                feedRequest_1.onerror = function () { return fail(classify_1(feedRequest_1.error)); };
                                                 feedRequest_1.onsuccess = function () {
                                                     var feed = feedRequest_1.result;
                                                     if (feed && feed.sourceEpoch === generation.sourceEpoch && feed.latestGeneration === generation.generation) {
                                                         feed.latestGeneration = null;
                                                         feed.mutation += 1;
                                                         states_1.put(feed);
-                                                        var sourceRequest_2 = states_1.get("GS|" + generation.sourceKey);
-                                                        sourceRequest_2.onsuccess = function () {
-                                                            var source = sourceRequest_2.result;
+                                                        var sourceRequest_1 = states_1.get("GS|" + generation.sourceKey);
+                                                        sourceRequest_1.onerror = function () { return fail(classify_1(sourceRequest_1.error)); };
+                                                        sourceRequest_1.onsuccess = function () {
+                                                            var source = sourceRequest_1.result;
                                                             if (source && source.epoch === generation.sourceEpoch && !source.deleted) {
                                                                 if (feed.activeGeneration === null)
                                                                     source.stagedOnlyFeedCount = Math.max(0, source.stagedOnlyFeedCount - 1);

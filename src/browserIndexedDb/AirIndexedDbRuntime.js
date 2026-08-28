@@ -102,6 +102,16 @@
                 ["generationKey", "channelKey", "effectiveEndMs", "startMs"],
                 { unique: true },
               );
+              programmes.createIndex(
+                "generationChannelFiniteStart",
+                ["generationKey", "channelKey", "finiteStartMs"],
+                { unique: true },
+              );
+              programmes.createIndex(
+                "generationChannelOpenStart",
+                ["generationKey", "channelKey", "openStartMs"],
+                { unique: true },
+              );
               programmes.createIndex("generationLocator", ["generationKey", "key"], { unique: true });
             }
             if (!database.objectStoreNames.contains(STORE.guideLeases)) {
@@ -677,6 +687,9 @@
                   retention: command.retention,
                   channelPrefix: command.channelBase + component + "|",
                   programmePrefix: command.programmeBase + component + "|",
+                  finiteStartPrefix: command.finiteStartBase + component + "|",
+                  openStartPrefix: command.openStartBase + component + "|",
+                  maxFiniteSpanMs: 0,
                   status: "staging",
                   expiresAt: command.nowMs + command.generationIdleTimeoutMillis,
                   batchCount: 0,
@@ -724,42 +737,90 @@
             generationRequest.onerror = () => fail(classify(generationRequest.error));
             generationRequest.onsuccess = () => {
               const generation = generationRequest.result;
-              if (!generation || generation.status !== "staging") { setResult({ status: "terminal", value: false }); return; }
-              const feedRequest = tx.objectStore(STORE.guideStates).get(generation.feedStateKey);
-              feedRequest.onerror = () => fail(classify(feedRequest.error));
-              feedRequest.onsuccess = () => {
-                const feed = feedRequest.result;
-                if (!feed || feed.latestGeneration !== generation.generation || generation.expiresAt <= command.nowMs) {
-                  setResult({ status: "terminal", value: false });
-                  return;
+              const abandonablePoison = command.op === "guideAbandon" && generation && generation.status === "poisoned";
+              if (!generation || (generation.status !== "staging" && !abandonablePoison)) {
+                setResult({ status: "terminal", value: false }); return;
+              }
+              const states = tx.objectStore(STORE.guideStates);
+              const sourceRequest = states.get(generation.sourceStateKey);
+              sourceRequest.onerror = () => fail(classify(sourceRequest.error));
+              sourceRequest.onsuccess = () => {
+                const source = sourceRequest.result;
+                if (!source || source.deleted || source.epoch !== generation.sourceEpoch) {
+                  setResult({ status: "terminal", value: false }); return;
                 }
-                if (command.op === "guideRenewGeneration") {
-                  generation.expiresAt = command.nowMs + command.generationIdleTimeoutMillis;
-                  tx.objectStore(STORE.guideGenerations).put(generation);
-                  guideQueuePut(tx, generation.key, generation.expiresAt);
-                  setResult({ status: "ok", value: true });
-                } else {
-                  const sourceRequest = tx.objectStore(STORE.guideStates).get(generation.sourceStateKey);
-                  sourceRequest.onerror = () => fail(classify(sourceRequest.error));
-                  sourceRequest.onsuccess = () => {
-                    const source = sourceRequest.result;
+                const feedRequest = states.get(generation.feedStateKey);
+                feedRequest.onerror = () => fail(classify(feedRequest.error));
+                feedRequest.onsuccess = () => {
+                  const feed = feedRequest.result;
+                  if (
+                    !feed || feed.sourceEpoch !== generation.sourceEpoch ||
+                    feed.latestGeneration !== generation.generation ||
+                    (generation.status === "staging" && generation.expiresAt <= command.nowMs)
+                  ) {
+                    setResult({ status: "terminal", value: false });
+                    return;
+                  }
+                  if (command.op === "guideRenewGeneration") {
+                    generation.expiresAt = command.nowMs + command.generationIdleTimeoutMillis;
+                    tx.objectStore(STORE.guideGenerations).put(generation);
+                    guideQueuePut(tx, generation.key, generation.expiresAt);
+                    setResult({ status: "ok", value: true });
+                  } else {
                     generation.status = "abandoned";
                     generation.expiresAt = 0;
                     feed.latestGeneration = null;
                     feed.mutation += 1;
-                    if (source && !source.deleted && source.epoch === generation.sourceEpoch) {
-                      if (feed.activeGeneration === null) {
-                        source.stagedOnlyFeedCount = Math.max(0, source.stagedOnlyFeedCount - 1);
-                      }
-                      source.mutation += 1;
-                      tx.objectStore(STORE.guideStates).put(source);
+                    if (feed.activeGeneration === null) {
+                      source.stagedOnlyFeedCount = Math.max(0, source.stagedOnlyFeedCount - 1);
                     }
-                    tx.objectStore(STORE.guideStates).put(feed);
+                    source.mutation += 1;
+                    states.put(source);
+                    states.put(feed);
                     tx.objectStore(STORE.guideGenerations).put(generation);
                     guideQueuePut(tx, generation.key, 0);
                     setResult({ status: "ok", value: true });
-                  };
+                  }
+                };
+              };
+            };
+          });
+        case "guideRejectStage":
+          return transaction(database, [STORE.guideStates, STORE.guideGenerations, STORE.guideCleanupQueue], "readwrite", command.operationId, (tx, setResult, fail) => {
+            const generations = tx.objectStore(STORE.guideGenerations);
+            const request = generations.get(command.generationKey);
+            request.onerror = () => fail(classify(request.error));
+            request.onsuccess = () => {
+              const generation = request.result;
+              if (!generation) { setResult({ status: "stale" }); return; }
+              if (generation.status === "poisoned") { setResult({ status: "limit" }); return; }
+              if (generation.status !== "staging" || generation.expiresAt <= command.nowMs) {
+                setResult({ status: "stale" }); return;
+              }
+              const states = tx.objectStore(STORE.guideStates);
+              const sourceRequest = states.get(generation.sourceStateKey);
+              sourceRequest.onerror = () => fail(classify(sourceRequest.error));
+              sourceRequest.onsuccess = () => {
+                const source = sourceRequest.result;
+                if (!source || source.deleted || source.epoch !== generation.sourceEpoch) {
+                  setResult({ status: "stale" }); return;
                 }
+                const feedRequest = states.get(generation.feedStateKey);
+                feedRequest.onerror = () => fail(classify(feedRequest.error));
+                feedRequest.onsuccess = () => {
+                  const feed = feedRequest.result;
+                  if (!feed || feed.sourceEpoch !== generation.sourceEpoch || feed.latestGeneration !== generation.generation) {
+                    setResult({ status: "stale" }); return;
+                  }
+                  generation.batchCount += 1;
+                  generation.inputChannelRows += command.inputChannelRows;
+                  generation.inputProgrammeRows += command.inputProgrammeRows;
+                  generation.status = "poisoned";
+                  generation.expiresAt = 0;
+                  generations.put(generation);
+                  guideQueuePut(tx, generation.key, 0);
+                  setResult({ status: "limit" });
+                };
               };
             };
           });
@@ -770,19 +831,24 @@
             generationRequest.onerror = () => fail(classify(generationRequest.error));
             generationRequest.onsuccess = () => {
               const generation = generationRequest.result;
+              if (generation && generation.status === "poisoned") { setResult({ status: "limit" }); return; }
               if (!generation || generation.status !== "staging" || generation.expiresAt <= command.nowMs) {
                 setResult({ status: "stale" }); return;
               }
-              const feedRequest = tx.objectStore(STORE.guideStates).get(generation.feedStateKey);
-              feedRequest.onerror = () => fail(classify(feedRequest.error));
-              feedRequest.onsuccess = () => {
+              const states = tx.objectStore(STORE.guideStates);
+              const sourceRequest = states.get(generation.sourceStateKey);
+              sourceRequest.onerror = () => fail(classify(sourceRequest.error));
+              sourceRequest.onsuccess = () => {
+                const source = sourceRequest.result;
+                if (!source || source.deleted || source.epoch !== generation.sourceEpoch) {
+                  setResult({ status: "stale" }); return;
+                }
+                const feedRequest = states.get(generation.feedStateKey);
+                feedRequest.onerror = () => fail(classify(feedRequest.error));
+                feedRequest.onsuccess = () => {
                 const feed = feedRequest.result;
                 if (!feed || feed.latestGeneration !== generation.generation) { setResult({ status: "stale" }); return; }
                 const batchItems = command.channels.length + command.programmes.length;
-                if (batchItems > command.maxBatchItems && generation.batchCount === 0) {
-                  setResult({ status: "limit" });
-                  return;
-                }
                 generation.batchCount += 1;
                 generation.inputChannelRows += command.channels.length;
                 generation.inputProgrammeRows += command.programmes.length;
@@ -811,7 +877,10 @@
                   const channelCount = generation.channelCount + addedChannels;
                   const programmeCount = generation.programmeCount + addedProgrammes;
                   if (channelCount > command.maxChannels || programmeCount > command.maxProgrammes) {
+                    generation.status = "poisoned";
+                    generation.expiresAt = 0;
                     generations.put(generation);
+                    guideQueuePut(tx, generation.key, 0);
                     setResult({ status: "limit" });
                     return;
                   }
@@ -844,6 +913,14 @@
                   candidate.feedId = generation.feedId;
                   candidate.generation = generation.generation;
                   candidate.generationKey = generation.key;
+                  if (candidate.endMs === null) candidate.openStartMs = candidate.startMs;
+                  else {
+                    candidate.finiteStartMs = candidate.startMs;
+                    generation.maxFiniteSpanMs = Math.max(
+                      generation.maxFiniteSpanMs,
+                      candidate.effectiveEndMs - candidate.startMs,
+                    );
+                  }
                   const request = programmesStore.get(candidate.key);
                   request.onerror = () => fail(classify(request.error));
                   request.onsuccess = () => {
@@ -853,6 +930,7 @@
                     pending -= 1; complete();
                   };
                 });
+                };
               };
             };
           });
@@ -1098,34 +1176,81 @@
         case "durableGuideWindow":
           return transaction(database, [STORE.guideLeases, STORE.guideGenerations, STORE.guideProgrammes], "readonly", command.operationId, (tx, setResult, fail) => {
             guideLease(tx, command, (_lease, generation) => {
-              const prefix = command.channelProgrammePrefix;
-              const lower = command.afterKey === null ? prefix : command.afterKey;
-              const upper = prefix + command.untilKey;
-              const range = IDBKeyRange.bound(lower, upper, command.afterKey !== null, true);
+              const store = tx.objectStore(STORE.guideProgrammes);
+              const finiteIndex = store.index("generationChannelFiniteStart");
+              const openIndex = store.index("generationChannelOpenStart");
+              const finiteFloor = Math.max(
+                generation.retention.retainedFromMs,
+                command.fromMs - generation.maxFiniteSpanMs,
+              );
+              const finiteLower = command.afterStartMs === null
+                ? finiteFloor
+                : Math.max(finiteFloor, command.afterStartMs);
+              const openLower = command.afterStartMs === null
+                ? generation.retention.retainedFromMs
+                : Math.max(generation.retention.retainedFromMs, command.afterStartMs);
+              const finiteRange = IDBKeyRange.bound(
+                [generation.key, command.channelKey, finiteLower],
+                [generation.key, command.channelKey, command.untilMs],
+                command.afterStartMs !== null && command.afterStartMs >= finiteFloor,
+                true,
+              );
+              const openRange = IDBKeyRange.bound(
+                [generation.key, command.channelKey, openLower],
+                [generation.key, command.channelKey, command.untilMs],
+                command.afterStartMs !== null && command.afterStartMs >= generation.retention.retainedFromMs,
+                true,
+              );
               const rows = [];
               let payloadBytes = 0;
-              const request = tx.objectStore(STORE.guideProgrammes).openCursor(range);
-              request.onerror = () => fail(classify(request.error));
-              request.onsuccess = () => {
-                const cursor = request.result;
-                if (!cursor) { setResult({ status: "ok", rows: rows, nextKey: null, truncated: false, payloadBytes: payloadBytes }); return; }
-                const row = cursor.value;
-                if (row.effectiveEndMs <= command.fromMs) { cursor.continue(); return; }
-                const bytes = guideProgrammeBytes(row);
-                if (rows.length >= command.limit || payloadBytes + bytes > command.payloadByteLimit) {
-                  setResult({
-                    status: "ok",
-                    rows: rows,
-                    nextKey: rows.length === 0 ? command.afterKey : rows[rows.length - 1].cursorKey,
-                    truncated: true,
-                    payloadBytes: payloadBytes,
-                  });
-                  return;
-                }
-                rows.push(Object.assign({ cursorKey: cursor.key, locatorKey: cursor.key }, row));
-                payloadBytes += bytes;
+              let visits = 0;
+              let finiteCursor;
+              let openCursor;
+              let finiteReady = false;
+              let openReady = false;
+              const finish = (truncated) => setResult({
+                status: "ok",
+                rows: rows,
+                nextStartMs: truncated && rows.length > 0 ? rows[rows.length - 1].startMs : null,
+                truncated: truncated,
+                payloadBytes: payloadBytes,
+              });
+              const advance = (kind, cursor) => {
+                if (kind === "finite") finiteReady = false;
+                else openReady = false;
                 cursor.continue();
               };
+              const pump = () => {
+                if (!finiteReady || !openReady) return;
+                if (!finiteCursor && !openCursor) { finish(false); return; }
+                let kind;
+                let cursor;
+                if (!openCursor || (finiteCursor && (
+                  finiteCursor.value.startMs < openCursor.value.startMs ||
+                  (finiteCursor.value.startMs === openCursor.value.startMs && finiteCursor.primaryKey < openCursor.primaryKey)
+                ))) {
+                  kind = "finite"; cursor = finiteCursor;
+                } else {
+                  kind = "open"; cursor = openCursor;
+                }
+                if (visits >= command.maxIndexVisits) { setResult({ status: "limit" }); return; }
+                visits += 1;
+                const row = cursor.value;
+                if (row.effectiveEndMs <= command.fromMs) { advance(kind, cursor); return; }
+                const bytes = guideProgrammeBytes(row);
+                if (rows.length >= command.limit || payloadBytes + bytes > command.payloadByteLimit) {
+                  finish(true); return;
+                }
+                rows.push(Object.assign({ locatorKey: cursor.primaryKey }, row));
+                payloadBytes += bytes;
+                advance(kind, cursor);
+              };
+              const finiteRequest = finiteIndex.openCursor(finiteRange);
+              finiteRequest.onerror = () => fail(classify(finiteRequest.error));
+              finiteRequest.onsuccess = () => { finiteCursor = finiteRequest.result; finiteReady = true; pump(); };
+              const openRequest = openIndex.openCursor(openRange);
+              openRequest.onerror = () => fail(classify(openRequest.error));
+              openRequest.onsuccess = () => { openCursor = openRequest.result; openReady = true; pump(); };
             }, setResult, fail);
           });
         case "guideNowNext":
@@ -1187,6 +1312,9 @@
                 const generations = tx.objectStore(STORE.guideGenerations);
                 const allocate = () => {
                   const generation = feed.nextGeneration;
+                  if (!Number.isSafeInteger(generation) || generation <= 0) {
+                    fail("AIR_IDB_GENERATION_EXHAUSTED"); return;
+                  }
                   const component = sortableKey(generation);
                   const generationKey = command.generationPrefix + component;
                   feed.nextGeneration = generation + 1;
@@ -1196,6 +1324,7 @@
                   const row = {
                     key: generationKey,
                     sourceKey: command.sourceKey,
+                    sourceStateKey: command.sourceStateKey,
                     feedId: command.feedId,
                     sourceEpoch: source.epoch,
                     sourceEpochKey: command.sourceKey + "|" + sortableKey(source.epoch),
@@ -1205,6 +1334,9 @@
                     retention: command.retention,
                     channelPrefix: command.channelBase + component + "|",
                     programmePrefix: command.programmeBase + component + "|",
+                    finiteStartPrefix: command.finiteStartBase + component + "|",
+                    openStartPrefix: command.openStartBase + component + "|",
+                    maxFiniteSpanMs: 0,
                     status: "staging",
                     purpose: "prune",
                     expiresAt: command.nowMs + command.generationIdleTimeoutMillis,
@@ -1247,10 +1379,18 @@
                 if (!feed || feed.latestGeneration !== generation.generation) {
                   setResult({ status: "superseded", current: guideSnapshot(feed) }); return;
                 }
-                generation.status = "abandoned"; generation.expiresAt = 0;
-                feed.latestGeneration = null;
-                generations.put(generation); states.put(feed); guideQueuePut(tx, generation.key, 0);
-                setResult({ status: "unchanged", current: guideSnapshot(feed) });
+                const sourceRequest = states.get(generation.sourceStateKey);
+                sourceRequest.onerror = () => fail(classify(sourceRequest.error));
+                sourceRequest.onsuccess = () => {
+                  const source = sourceRequest.result;
+                  if (!source || source.deleted || source.epoch !== generation.sourceEpoch) {
+                    setResult({ status: "superseded", current: null }); return;
+                  }
+                  generation.status = "abandoned"; generation.expiresAt = 0;
+                  feed.latestGeneration = null;
+                  generations.put(generation); states.put(feed); guideQueuePut(tx, generation.key, 0);
+                  setResult({ status: "unchanged", current: guideSnapshot(feed) });
+                };
               };
             };
           });
@@ -1341,12 +1481,12 @@
             const queue = tx.objectStore(STORE.guideCleanupQueue);
             const queueIndex = queue.index("cleanupAt");
             const finish = (removedRows) => {
-              const countRequest = queueIndex.count(IDBKeyRange.upperBound(command.nowMs));
-              countRequest.onerror = () => fail(classify(countRequest.error));
-              countRequest.onsuccess = () => setResult({
+              const moreRequest = queueIndex.openKeyCursor(IDBKeyRange.upperBound(command.nowMs));
+              moreRequest.onerror = () => fail(classify(moreRequest.error));
+              moreRequest.onsuccess = () => setResult({
                 status: "ok",
                 removedRows: removedRows,
-                hasMore: countRequest.result > 0,
+                hasMore: moreRequest.result !== null,
               });
             };
             const processGeneration = (generation, queueRow) => {
@@ -1363,19 +1503,17 @@
               }
               const leases = tx.objectStore(STORE.guideLeases);
               const leaseRequest = leases.index("generationKey").openCursor(IDBKeyRange.only(generation.key));
-              let liveLeaseExpiry = null;
               leaseRequest.onerror = () => fail(classify(leaseRequest.error));
               leaseRequest.onsuccess = () => {
                 const cursor = leaseRequest.result;
                 if (cursor) {
                   const lease = cursor.value;
-                  if (lease.expiresAt <= command.nowMs) cursor.delete();
-                  else liveLeaseExpiry = liveLeaseExpiry === null ? lease.expiresAt : Math.min(liveLeaseExpiry, lease.expiresAt);
-                  cursor.continue();
-                  return;
-                }
-                if (liveLeaseExpiry !== null) {
-                  queueRow.cleanupAt = liveLeaseExpiry;
+                  if (lease.expiresAt <= command.nowMs) {
+                    cursor.delete();
+                    queueRow.cleanupAt = 0;
+                  } else {
+                    queueRow.cleanupAt = lease.expiresAt;
+                  }
                   queue.put(queueRow);
                   finish(0);
                   return;
@@ -1405,15 +1543,17 @@
                   };
                 };
                 const checkEmpty = () => {
-                  const channelsCount = tx.objectStore(STORE.guideChannels).count(rangeForPrefix(generation.channelPrefix));
-                  const programmesCount = tx.objectStore(STORE.guideProgrammes).count(rangeForPrefix(generation.programmePrefix));
+                  const channelsCount = tx.objectStore(STORE.guideChannels)
+                    .openKeyCursor(rangeForPrefix(generation.channelPrefix));
+                  const programmesCount = tx.objectStore(STORE.guideProgrammes)
+                    .openKeyCursor(rangeForPrefix(generation.programmePrefix));
                   let pending = 2;
-                  let total = 0;
+                  let hasPayload = false;
                   const done = (request) => {
-                    total += request.result;
+                    hasPayload = hasPayload || request.result !== null;
                     pending -= 1;
                     if (pending !== 0) return;
-                    if (total === 0) {
+                    if (!hasPayload) {
                       tx.objectStore(STORE.guideGenerations).delete(generation.key);
                       if (queueRow.kind === "source") {
                         queueRow.cleanupAt = 0;
@@ -1423,6 +1563,7 @@
                       }
                       const states = tx.objectStore(STORE.guideStates);
                       const feedRequest = states.get(generation.feedStateKey);
+                      feedRequest.onerror = () => fail(classify(feedRequest.error));
                       feedRequest.onsuccess = () => {
                         const feed = feedRequest.result;
                         if (feed && feed.sourceEpoch === generation.sourceEpoch && feed.latestGeneration === generation.generation) {
@@ -1430,6 +1571,7 @@
                           feed.mutation += 1;
                           states.put(feed);
                           const sourceRequest = states.get("GS|" + generation.sourceKey);
+                          sourceRequest.onerror = () => fail(classify(sourceRequest.error));
                           sourceRequest.onsuccess = () => {
                             const source = sourceRequest.result;
                             if (source && source.epoch === generation.sourceEpoch && !source.deleted) {

@@ -52,6 +52,7 @@ internal class IndexedDbDurableGuideStore(
             key = key,
             value = result.requiredLong("generation"),
             mutationEpoch = result.requiredLong("mutationEpoch"),
+            retention = retention,
         )
     }
 
@@ -80,6 +81,23 @@ internal class IndexedDbDurableGuideStore(
         programmes: List<DurableGuideProgrammeRecord>,
     ): DurableGuideCounts {
         val token = generation.ownedGeneration() ?: throw DurableGuideStoreException.Stale()
+        val inputRows = channels.size.toLong() + programmes.size.toLong()
+        if (inputRows > DurableGuideLimits.MAX_BATCH_ITEMS) {
+            val rejected = command("guideRejectStage") {
+                put("generationKey", GuideKeys(token.key).generationKey(token.value))
+                put("nowMs", nowMillis())
+                put("inputChannelRows", channels.size)
+                put("inputProgrammeRows", programmes.size)
+            }.objectResult()
+            rejected.throwExpectedFailure()
+            throw DurableGuideStoreException.Corrupt()
+        }
+        programmes.forEach { candidate ->
+            require(
+                candidate.start < token.retention.retainedUntil &&
+                    candidate.effectiveEnd > token.retention.retainedFrom,
+            ) { "Programme lies outside the generation retention interval" }
+        }
         val keys = GuideKeys(token.key)
         val generationComponent = positiveKey(token.value)
         val channelPrefix = keys.channelPrefix(generationComponent)
@@ -284,7 +302,7 @@ internal class IndexedDbDurableGuideStore(
         val rows = result.requiredArray("rows").map { it.jsonObject.toProgramme() }
         return DurableGuideWindowPage(
             rows,
-            result.optionalString("nextKey")?.let { Cursor(ownerId, domain, it) },
+            result.optionalLong("nextStartMs")?.let { Cursor(ownerId, domain, it.toString()) },
             result.requiredBoolean("truncated"),
         )
     }
@@ -315,6 +333,7 @@ internal class IndexedDbDurableGuideStore(
         var payloadBytes = 0
         var truncated = false
         val channels = request.channelKeys.map { channelKey ->
+            val rowBudgetExhausted = rowsRemaining == 0
             val result = windowPage(
                 token,
                 channelKey,
@@ -322,14 +341,14 @@ internal class IndexedDbDurableGuideStore(
                 request.until,
                 afterKey = null,
                 limit = minOf(request.perChannelLimit, rowsRemaining.coerceAtLeast(1)),
-                payloadByteLimit = bytesRemaining,
+                payloadByteLimit = if (rowBudgetExhausted) 0 else bytesRemaining,
             )
             val rows = result.requiredArray("rows").map { it.jsonObject.toProgramme() }
             val used = result.requiredLong("payloadBytes").toInt()
             payloadBytes += used
             bytesRemaining -= used
             rowsRemaining -= rows.size
-            val channelTruncated = result.requiredBoolean("truncated") || rowsRemaining == 0 || bytesRemaining == 0
+            val channelTruncated = result.requiredBoolean("truncated")
             truncated = truncated || channelTruncated
             DurableGuideChannelWindow(channelKey, rows, channelTruncated)
         }
@@ -361,7 +380,13 @@ internal class IndexedDbDurableGuideStore(
             when (begin.requiredString("status")) {
                 "superseded" -> return DurableGuidePruneResult.Superseded(begin.optionalSnapshot("current", ownerId))
                 "limit" -> throw DurableGuideStoreException.Limit()
-                "ok" -> generation = Generation(ownerId, key, begin.requiredLong("generation"), begin.requiredLong("mutationEpoch"))
+                "ok" -> generation = Generation(
+                    ownerId,
+                    key,
+                    begin.requiredLong("generation"),
+                    begin.requiredLong("mutationEpoch"),
+                    retention,
+                )
                 else -> throw DurableGuideStoreException.Corrupt()
             }
             var counts = DurableGuideCounts(0, 0)
@@ -488,15 +513,14 @@ internal class IndexedDbDurableGuideStore(
     ): JsonObject {
         require(from < until)
         require(limit in 1..DurableGuideLimits.MAX_WINDOW_ITEMS)
-        val keys = GuideKeys(lease.snapshot.key)
-        val generation = positiveKey(lease.snapshot.generation)
         return leasedCommand("durableGuideWindow", lease) {
-            put("channelProgrammePrefix", keys.programmePrefix(generation) + channelKey.value + "|")
-            put("afterKey", afterKey)
+            put("channelKey", channelKey.value)
+            put("afterStartMs", afterKey?.toLongOrNull())
             put("fromMs", from.toEpochMilliseconds())
-            put("untilKey", signedKey(until.toEpochMilliseconds()))
+            put("untilMs", until.toEpochMilliseconds())
             put("limit", limit)
             put("payloadByteLimit", payloadByteLimit)
+            put("maxIndexVisits", maxOf(1_024, limit * 16).coerceAtMost(16_000))
         }
     }
 
@@ -576,6 +600,7 @@ internal class IndexedDbDurableGuideStore(
         override val key: DurableGuideKey,
         val value: Long,
         val mutationEpoch: Long,
+        val retention: DurableGuideRetention,
     ) : DurableGuideGeneration {
         override fun toString(): String = "DurableGuideGeneration(<redacted>)"
     }
@@ -623,6 +648,8 @@ private data class GuideKeys(val key: DurableGuideKey) {
     val activeFeedBase = "GA|$source|"
     val channelBase = "GC|$source|$feed|"
     val programmeBase = "GP|$source|$feed|"
+    val finiteStartBase = "GW|$source|$feed|"
+    val openStartBase = "GO|$source|$feed|"
 
     fun generationKey(generation: Long): String = generationPrefix + positiveKey(generation)
     fun channelPrefix(generation: String): String = "$channelBase$generation|"
@@ -643,6 +670,8 @@ private fun kotlinx.serialization.json.JsonObjectBuilder.putKeys(keys: GuideKeys
     put("feedComponent", keys.feed)
     put("channelBase", keys.channelBase)
     put("programmeBase", keys.programmeBase)
+    put("finiteStartBase", keys.finiteStartBase)
+    put("openStartBase", keys.openStartBase)
 }
 
 private fun DurableGuideRetention.toJson(): JsonObject = buildJsonObject {

@@ -66,6 +66,14 @@ class BrowserDurableCatalogStoreTest {
     }
 
     @Test
+    fun durableGuideReviewRegressionsRunInARealBrowser() = runTest(timeout = 60.seconds) {
+        if (!verifyIndexedDbIsAvailableOrFailsHonestly()) return@runTest
+        verifyIndexedDbGuideReviewRegressions(uniqueDatabase("guide-review")) { databaseName, nowMillis ->
+            openBrowserDurableCatalogStoreForTest(databaseName, nowMillis = nowMillis)
+        }
+    }
+
+    @Test
     fun versionThreeUpgradePreservesVersionTwoMediaStores() = runTest(timeout = 30.seconds) {
         if (!verifyIndexedDbIsAvailableOrFailsHonestly()) return@runTest
         val databaseName = uniqueDatabase("v2-upgrade")
