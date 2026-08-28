@@ -1669,6 +1669,16 @@
                 finish(0);
                 return;
               }
+              if (generation.status === "staging") {
+                generation.cleanupStarted = true;
+                generation.status = "expired";
+                generation.expiresAt = 0;
+                tx.objectStore(STORE.guideGenerations).put(generation);
+                queueRow.cleanupAt = 0;
+                queue.put(queueRow);
+                finish(0);
+                return;
+              }
               const leases = tx.objectStore(STORE.guideLeases);
               const leaseRequest = leases.index("generationKey").openCursor(IDBKeyRange.only(generation.key));
               leaseRequest.onerror = () => fail(classify(leaseRequest.error));

@@ -1864,6 +1864,16 @@
                                     finish(0);
                                     return;
                                 }
+                                if (generation.status === "staging") {
+                                    generation.cleanupStarted = true;
+                                    generation.status = "expired";
+                                    generation.expiresAt = 0;
+                                    tx.objectStore(STORE_1.guideGenerations).put(generation);
+                                    queueRow.cleanupAt = 0;
+                                    queue.put(queueRow);
+                                    finish(0);
+                                    return;
+                                }
                                 var leases = tx.objectStore(STORE_1.guideLeases);
                                 var leaseRequest = leases.index("generationKey").openCursor(IDBKeyRange.only(generation.key));
                                 leaseRequest.onerror = function () { return fail(classify_1(leaseRequest.error)); };
