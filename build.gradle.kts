@@ -7,6 +7,7 @@ plugins {
     alias(libs.plugins.kotlin.multiplatform)
     alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.android.library)
+    alias(libs.plugins.sqldelight)
 }
 
 group = "com.getair"
@@ -39,12 +40,30 @@ kotlin {
             api(libs.kotlinx.coroutines.core)
             api(libs.kotlinx.datetime)
             implementation(libs.kotlinx.serialization.json)
+            implementation(libs.sqldelight.runtime)
         }
         commonTest.dependencies {
             implementation(kotlin("test"))
             implementation(libs.kotlinx.coroutines.test)
         }
         wasmJsMain.dependencies { implementation(libs.kotlinx.browser) }
+        androidMain.dependencies { implementation(libs.sqldelight.android.driver) }
+        jvmMain.dependencies {
+            implementation(libs.sqldelight.sqlite.driver)
+            runtimeOnly(libs.sqlite.jdbc)
+        }
+        nativeMain.dependencies { implementation(libs.sqldelight.native.driver) }
+    }
+}
+
+sqldelight {
+    databases {
+        create("AirCatalogDatabase") {
+            packageName.set("com.getair.core.catalog.db")
+            srcDirs.setFrom("src/commonMain/sqldelight")
+            schemaOutputDirectory.set(file("src/commonMain/sqldelight/databases"))
+            verifyMigrations.set(true)
+        }
     }
 }
 
@@ -60,5 +79,37 @@ tasks.withType<Test>().configureEach {
         exceptionFormat = TestExceptionFormat.FULL
         showCauses = true
         showStackTraces = true
+    }
+}
+
+val jvmCatalogRuntime = configurations.named("jvmRuntimeClasspath")
+
+tasks.register("assertJvmCatalogDependencies") {
+    group = "verification"
+    description = "Asserts the catalog store's effective JVM persistence dependency versions."
+    inputs.files(jvmCatalogRuntime)
+    doLast {
+        val artifacts = inputs.files.files.map { it.name }.toSet()
+        check("runtime-jvm-2.1.0.jar" in artifacts) {
+            "Expected SQLDelight runtime 2.1.0"
+        }
+        check("sqlite-driver-2.1.0.jar" in artifacts) {
+            "Expected SQLDelight sqlite-driver 2.1.0"
+        }
+        check("sqlite-jdbc-3.51.3.0.jar" in artifacts) {
+            "Expected effective Xerial SQLite JDBC 3.51.3.0"
+        }
+        check("kotlin-stdlib-2.1.10.jar" in artifacts) {
+            "Expected Kotlin stdlib 2.1.10"
+        }
+    }
+}
+
+tasks.configureEach {
+    if (
+        name == "verifyCommonMainAirCatalogDatabaseMigration" ||
+        name == "generateCommonMainAirCatalogDatabaseInterface"
+    ) {
+        mustRunAfter("generateCommonMainAirCatalogDatabaseSchema")
     }
 }

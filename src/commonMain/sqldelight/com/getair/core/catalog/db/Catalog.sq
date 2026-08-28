@@ -1,0 +1,246 @@
+CREATE TABLE catalog_source (
+  source_id TEXT NOT NULL PRIMARY KEY,
+  active_generation INTEGER,
+  next_generation INTEGER NOT NULL DEFAULT 1,
+  revision INTEGER NOT NULL DEFAULT 0,
+  activated_at_ms INTEGER,
+  deleted INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1))
+);
+
+CREATE TABLE catalog_generation (
+  source_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  staged_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (source_id, generation)
+);
+
+CREATE TABLE catalog_entry (
+  source_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  catalog_id TEXT NOT NULL,
+  entity_id TEXT NOT NULL,
+  sort_order INTEGER NOT NULL,
+  display_name TEXT NOT NULL,
+  payload_version INTEGER NOT NULL,
+  payload TEXT NOT NULL,
+  PRIMARY KEY (source_id, generation, kind, catalog_id, entity_id)
+);
+
+CREATE UNIQUE INDEX catalog_entry_order
+ON catalog_entry(source_id, generation, kind, catalog_id, sort_order, entity_id);
+
+CREATE TABLE epg_channel (
+  source_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  channel_id TEXT NOT NULL,
+  sort_order INTEGER NOT NULL,
+  display_name TEXT NOT NULL,
+  payload_version INTEGER NOT NULL,
+  payload TEXT NOT NULL,
+  PRIMARY KEY (source_id, generation, channel_id)
+);
+
+CREATE UNIQUE INDEX epg_channel_order
+ON epg_channel(source_id, generation, sort_order, channel_id);
+
+CREATE TABLE epg_programme (
+  source_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  channel_id TEXT NOT NULL,
+  start_ms INTEGER NOT NULL,
+  end_ms INTEGER NOT NULL,
+  event_id TEXT NOT NULL,
+  payload_version INTEGER NOT NULL,
+  payload TEXT NOT NULL,
+  PRIMARY KEY (source_id, generation, channel_id, start_ms, event_id),
+  CHECK (end_ms > start_ms)
+);
+
+CREATE INDEX epg_programme_end
+ON epg_programme(source_id, generation, channel_id, end_ms, start_ms);
+
+ensureSource:
+INSERT OR IGNORE INTO catalog_source(source_id) VALUES (?);
+
+prepareSourceRefresh:
+UPDATE catalog_source SET deleted = 0 WHERE source_id = ?;
+
+sourceState:
+SELECT active_generation, next_generation, revision, activated_at_ms, deleted
+FROM catalog_source
+WHERE source_id = ?;
+
+advanceGeneration:
+UPDATE catalog_source
+SET next_generation = next_generation + 1
+WHERE source_id = ? AND next_generation = ?;
+
+insertGeneration:
+INSERT INTO catalog_generation(source_id, generation, staged_at_ms)
+VALUES (?, ?, ?);
+
+generationExists:
+SELECT EXISTS(
+  SELECT 1 FROM catalog_generation
+  WHERE source_id = ? AND generation = ?
+);
+
+nextCatalogOrder:
+SELECT COALESCE(MAX(sort_order) + 1, 0)
+FROM catalog_entry
+WHERE source_id = ? AND generation = ? AND kind = ? AND catalog_id = ?;
+
+insertCatalogEntry:
+INSERT OR REPLACE INTO catalog_entry(
+  source_id, generation, kind, catalog_id, entity_id, sort_order,
+  display_name, payload_version, payload
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+nextChannelOrder:
+SELECT COALESCE(MAX(sort_order) + 1, 0)
+FROM epg_channel
+WHERE source_id = ? AND generation = ?;
+
+insertEpgChannel:
+INSERT OR REPLACE INTO epg_channel(
+  source_id, generation, channel_id, sort_order, display_name,
+  payload_version, payload
+) VALUES (?, ?, ?, ?, ?, ?, ?);
+
+insertEpgProgramme:
+INSERT OR REPLACE INTO epg_programme(
+  source_id, generation, channel_id, start_ms, end_ms, event_id,
+  payload_version, payload
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+
+generationCatalogCount:
+SELECT COUNT(*) FROM catalog_entry WHERE source_id = ? AND generation = ?;
+
+generationChannelCount:
+SELECT COUNT(*) FROM epg_channel WHERE source_id = ? AND generation = ?;
+
+generationProgrammeCount:
+SELECT COUNT(*) FROM epg_programme WHERE source_id = ? AND generation = ?;
+
+activateGeneration:
+UPDATE catalog_source
+SET active_generation = ?,
+    revision = revision + 1,
+    activated_at_ms = ?,
+    deleted = 0
+WHERE source_id = ?;
+
+catalogPage:
+SELECT c.kind, c.catalog_id, c.entity_id, c.sort_order,
+       c.payload_version, c.payload
+FROM catalog_entry AS c
+JOIN catalog_source AS s
+  ON s.source_id = c.source_id AND s.active_generation = c.generation
+WHERE c.source_id = ? AND s.deleted = 0
+  AND c.kind = ? AND c.catalog_id = ? AND c.sort_order > ?
+ORDER BY c.sort_order, c.entity_id
+LIMIT ?;
+
+channelPage:
+SELECT c.channel_id, c.sort_order, c.payload_version, c.payload
+FROM epg_channel AS c
+JOIN catalog_source AS s
+  ON s.source_id = c.source_id AND s.active_generation = c.generation
+WHERE c.source_id = ? AND s.deleted = 0 AND c.sort_order > ?
+ORDER BY c.sort_order, c.channel_id
+LIMIT ?;
+
+guideWindow:
+SELECT p.event_id, p.payload_version, p.payload
+FROM epg_programme AS p
+JOIN catalog_source AS s
+  ON s.source_id = p.source_id AND s.active_generation = p.generation
+WHERE p.source_id = ? AND s.deleted = 0 AND p.channel_id = ?
+  AND p.start_ms < ? AND p.end_ms > ?
+ORDER BY p.start_ms, p.event_id
+LIMIT ?;
+
+currentProgramme:
+SELECT p.event_id, p.payload_version, p.payload
+FROM epg_programme AS p
+JOIN catalog_source AS s
+  ON s.source_id = p.source_id AND s.active_generation = p.generation
+WHERE p.source_id = ? AND s.deleted = 0 AND p.channel_id = ?
+  AND p.start_ms <= ? AND p.end_ms > ?
+ORDER BY p.start_ms DESC, p.event_id
+LIMIT 1;
+
+nextProgramme:
+SELECT p.event_id, p.payload_version, p.payload
+FROM epg_programme AS p
+JOIN catalog_source AS s
+  ON s.source_id = p.source_id AND s.active_generation = p.generation
+WHERE p.source_id = ? AND s.deleted = 0 AND p.channel_id = ?
+  AND p.start_ms > ?
+ORDER BY p.start_ms, p.event_id
+LIMIT 1;
+
+markSourceDeleted:
+UPDATE catalog_source
+SET active_generation = NULL, revision = revision + 1, deleted = 1
+WHERE source_id = ? AND deleted = 0;
+
+orphanGenerations:
+SELECT g.source_id, g.generation
+FROM catalog_generation AS g
+LEFT JOIN catalog_source AS s ON s.source_id = g.source_id
+WHERE s.source_id IS NULL OR s.active_generation IS NULL
+   OR s.active_generation != g.generation OR s.deleted = 1
+ORDER BY g.staged_at_ms, g.source_id, g.generation
+LIMIT ?;
+
+deleteCatalogChunk:
+DELETE FROM catalog_entry
+WHERE rowid IN (
+  SELECT rowid FROM catalog_entry
+  WHERE source_id = ? AND generation = ?
+  LIMIT ?
+);
+
+deleteChannelChunk:
+DELETE FROM epg_channel
+WHERE rowid IN (
+  SELECT rowid FROM epg_channel
+  WHERE source_id = ? AND generation = ?
+  LIMIT ?
+);
+
+deleteProgrammeChunk:
+DELETE FROM epg_programme
+WHERE rowid IN (
+  SELECT rowid FROM epg_programme
+  WHERE source_id = ? AND generation = ?
+  LIMIT ?
+);
+
+generationRowCount:
+SELECT
+  (SELECT COUNT(*) FROM catalog_entry WHERE source_id = ? AND generation = ?) +
+  (SELECT COUNT(*) FROM epg_channel WHERE source_id = ? AND generation = ?) +
+  (SELECT COUNT(*) FROM epg_programme WHERE source_id = ? AND generation = ?);
+
+deleteEmptyGeneration:
+DELETE FROM catalog_generation
+WHERE source_id = ? AND generation = ?
+  AND NOT EXISTS (
+    SELECT 1 FROM catalog_entry WHERE source_id = ? AND generation = ?
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM epg_channel WHERE source_id = ? AND generation = ?
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM epg_programme WHERE source_id = ? AND generation = ?
+  );
+
+deleteEmptySource:
+DELETE FROM catalog_source
+WHERE source_id = ? AND deleted = 1
+  AND NOT EXISTS (
+    SELECT 1 FROM catalog_generation WHERE source_id = ?
+  );
