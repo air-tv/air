@@ -1,3 +1,5 @@
+import org.gradle.api.tasks.testing.Test
+import org.gradle.api.tasks.testing.logging.TestExceptionFormat
 import org.jetbrains.kotlin.gradle.ExperimentalWasmDsl
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
@@ -50,4 +52,13 @@ android {
     namespace = "com.getair.core"
     compileSdk = 36
     defaultConfig { minSdk = 24 }
+}
+
+tasks.withType<Test>().configureEach {
+    testLogging {
+        events("failed")
+        exceptionFormat = TestExceptionFormat.FULL
+        showCauses = true
+        showStackTraces = true
+    }
 }
