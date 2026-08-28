@@ -8,6 +8,7 @@ import kotlin.js.toJsString
 import kotlin.random.Random
 import kotlin.test.Test
 import kotlin.test.assertContains
+import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.time.Duration.Companion.seconds
 
@@ -93,14 +94,12 @@ class BrowserDurableCatalogStoreTest {
         if (!verifyIndexedDbIsAvailableOrFailsHonestly()) return@runTest
         val databaseName = uniqueDatabase("v3-guide-upgrade")
         createLegacyV3GuideDatabase(databaseName.toJsString()).await<JsString>()
-        openBrowserDurableCatalogStore(databaseName).close()
-        val partial = inspectLegacyV3GuideUpgrade(databaseName.toJsString()).await<JsString>().toString()
-        assertContains(partial, "\"version\":4")
-        assertContains(partial, "\"legacy\":true")
-        assertContains(partial, "\"timelineCount\":512")
-        assertContains(partial, "\"complete\":false")
-        openBrowserDurableCatalogStore(databaseName).close()
+        val catalog = openBrowserDurableCatalogStore(databaseName)
+        assertEquals(2, (catalog as IndexedDbMigrationTestAccess).awaitGuideMigrationForTest())
+        catalog.close()
         val complete = inspectLegacyV3GuideUpgrade(databaseName.toJsString()).await<JsString>().toString()
+        assertContains(complete, "\"version\":4")
+        assertContains(complete, "\"legacy\":true")
         assertContains(complete, "\"timelineCount\":602")
         assertContains(complete, "\"complete\":true")
         assertContains(complete, "\"maxFiniteSpanMs\":1000")

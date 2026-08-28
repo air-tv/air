@@ -3,6 +3,7 @@ package com.getair.core.catalog
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import kotlinx.datetime.Instant
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -522,14 +523,19 @@ internal class IndexedDbDurableGuideStore(
     ): JsonObject {
         require(from < until)
         require(limit in 1..DurableGuideLimits.MAX_WINDOW_ITEMS)
-        return leasedCommand("durableGuideWindow", lease) {
-            put("channelKey", channelKey.value)
-            put("afterStartMs", afterKey?.toLongOrNull())
-            put("fromMs", from.toEpochMilliseconds())
-            put("untilMs", until.toEpochMilliseconds())
-            put("limit", limit)
-            put("payloadByteLimit", payloadByteLimit)
-            put("maxIndexVisits", maxOf(1_024, limit * 16).coerceAtMost(16_000))
+        while (true) {
+            val result = leasedCommand("durableGuideWindow", lease, allowNeedsMigration = true) {
+                put("channelKey", channelKey.value)
+                put("afterStartMs", afterKey?.toLongOrNull())
+                put("fromMs", from.toEpochMilliseconds())
+                put("untilMs", until.toEpochMilliseconds())
+                put("limit", limit)
+                put("payloadByteLimit", payloadByteLimit)
+                put("maxIndexVisits", maxOf(1_024, limit * 16).coerceAtMost(16_000))
+            }
+            if (result["status"]?.jsonPrimitive?.content != "needsMigration") return result
+            migrateLegacyRows(DurableGuideLimits.DEFAULT_CLEANUP_ROWS)
+            yield()
         }
     }
 
@@ -555,6 +561,7 @@ internal class IndexedDbDurableGuideStore(
         operation: String,
         lease: Lease,
         staleAsNull: Boolean = false,
+        allowNeedsMigration: Boolean = false,
         content: kotlinx.serialization.json.JsonObjectBuilder.() -> Unit,
     ): JsonObject {
         val keys = GuideKeys(lease.snapshot.key)
@@ -565,7 +572,9 @@ internal class IndexedDbDurableGuideStore(
             put("generationKey", keys.generationKey(lease.snapshot.generation))
             content()
         }.objectResult()
-        if (!staleAsNull || result["status"]?.jsonPrimitive?.content != "stale") result.throwExpectedFailure()
+        val status = result["status"]?.jsonPrimitive?.content
+        if (allowNeedsMigration && status == "needsMigration") return result
+        if (!staleAsNull || status != "stale") result.throwExpectedFailure()
         return result
     }
 

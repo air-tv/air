@@ -133,6 +133,14 @@
             if (!database.objectStoreNames.contains(STORE.guideMigration)) {
               database.createObjectStore(STORE.guideMigration, { keyPath: "key" });
             }
+            if (event.oldVersion < 3) {
+              openRequest.transaction.objectStore(STORE.guideMigration).put({
+                key: "legacy-v3",
+                afterKey: null,
+                pendingGenerationKey: null,
+                complete: true,
+              });
+            }
           }
         };
         openRequest.onblocked = () => {
@@ -1331,7 +1339,9 @@
                 request.onsuccess = () => {
                   const cursor = request.result;
                   if (!cursor) { finish(false); return; }
-                  if (visits >= command.maxIndexVisits) { setResult({ status: "limit" }); return; }
+                  if (visits >= command.maxIndexVisits) {
+                    setResult({ status: "needsMigration" }); return;
+                  }
                   visits += 1;
                   accept(cursor.value, cursor.primaryKey, () => cursor.continue());
                 };

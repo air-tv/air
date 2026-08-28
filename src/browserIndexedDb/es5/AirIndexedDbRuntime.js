@@ -127,6 +127,14 @@
                         if (!database.objectStoreNames.contains(STORE_1.guideMigration)) {
                             database.createObjectStore(STORE_1.guideMigration, { keyPath: "key" });
                         }
+                        if (event.oldVersion < 3) {
+                            openRequest.transaction.objectStore(STORE_1.guideMigration).put({
+                                key: "legacy-v3",
+                                afterKey: null,
+                                pendingGenerationKey: null,
+                                complete: true,
+                            });
+                        }
                     }
                 };
                 openRequest.onblocked = function () {
@@ -1482,7 +1490,7 @@
                                             return;
                                         }
                                         if (visits >= command.maxIndexVisits) {
-                                            setResult({ status: "limit" });
+                                            setResult({ status: "needsMigration" });
                                             return;
                                         }
                                         visits += 1;

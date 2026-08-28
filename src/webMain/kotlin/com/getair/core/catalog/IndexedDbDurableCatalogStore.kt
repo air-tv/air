@@ -13,8 +13,15 @@ import com.getair.iptv.model.IptvMovieMetadata
 import com.getair.iptv.model.IptvSeriesMetadata
 import com.getair.stremio.model.MetaPreview
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.yield
 import kotlinx.datetime.Clock
 import kotlinx.datetime.Instant
 import kotlinx.serialization.KSerializer
@@ -52,6 +59,10 @@ internal interface BrowserIndexedDbExecutor {
 internal class BrowserIndexedDbFailure(val code: String, cause: Throwable? = null) :
     IllegalStateException(code, cause)
 
+internal interface IndexedDbMigrationTestAccess {
+    suspend fun awaitGuideMigrationForTest(): Int
+}
+
 internal suspend fun openIndexedDbDurableCatalogStore(
     databaseName: String,
     executor: BrowserIndexedDbExecutor,
@@ -71,19 +82,34 @@ private class IndexedDbDurableCatalogStore(
     private val databaseName: String,
     private val executor: BrowserIndexedDbExecutor,
     private val nowMillis: () -> Long,
-) : DurableCatalogStore {
+) : DurableCatalogStore, IndexedDbMigrationTestAccess {
     private val writes = Mutex()
     private var nextOperation = 0L
     private var closed = false
+    private val migrationScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var migration: Deferred<Int>? = null
     private val guideStore = IndexedDbDurableGuideStore(databaseName, executor, nowMillis)
     override val guides: DurableGuideStore = guideStore
 
     suspend fun initialize(startupCleanupRows: Int, cleanupGuidesOnStartup: Boolean) {
         command("open") { }
-        guideStore.migrateLegacyRows(startupCleanupRows)
         cleanupUnreachable(startupCleanupRows)
         if (cleanupGuidesOnStartup) guides.cleanupUnreachable(startupCleanupRows)
+        migration = migrationScope.async {
+            var batches = 0
+            var hasMore: Boolean
+            yield()
+            do {
+                val result = guideStore.migrateLegacyRows(startupCleanupRows)
+                batches += 1
+                hasMore = result.hasMore
+                if (hasMore) yield()
+            } while (hasMore)
+            batches
+        }
     }
+
+    override suspend fun awaitGuideMigrationForTest(): Int = migration?.await() ?: 0
 
     override suspend fun beginRefresh(sourceId: LocalSourceId): CatalogGeneration = writes.withLock {
         val source = sourceId.component()
@@ -339,6 +365,7 @@ private class IndexedDbDurableCatalogStore(
     override fun close() {
         if (!closed) {
             closed = true
+            migrationScope.cancel()
             executor.close(databaseName)
         }
     }
