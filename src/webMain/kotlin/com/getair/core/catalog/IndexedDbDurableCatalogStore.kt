@@ -10,6 +10,7 @@ import com.getair.iptv.model.EpgProgramme
 import com.getair.iptv.model.IptvChannelMetadata
 import com.getair.iptv.model.IptvEpisodeMetadata
 import com.getair.iptv.model.IptvMovieMetadata
+import com.getair.iptv.model.IptvPlaylistEntryMetadata
 import com.getair.iptv.model.IptvSeriesMetadata
 import com.getair.stremio.model.MetaPreview
 import kotlinx.coroutines.CancellationException
@@ -430,6 +431,7 @@ private fun requireIndexedDbItemMatches(kind: DurableCatalogKind, item: DurableC
         DurableCatalogKind.IptvMovie -> item is DurableCatalogItem.IptvMovie
         DurableCatalogKind.IptvSeries -> item is DurableCatalogItem.IptvSeries
         DurableCatalogKind.IptvEpisode -> item is DurableCatalogItem.IptvEpisode
+        DurableCatalogKind.M3uPlaylistEntry -> item is DurableCatalogItem.M3uPlaylistEntry
     }
     require(matches) { "Catalog item kind does not match its catalog" }
 }
@@ -477,6 +479,15 @@ private fun encodeIndexedDbCatalogItem(item: DurableCatalogItem): IndexedDbEncod
             IndexedDbEncodedCatalogItem(
                 item.value.id.value,
                 encodeIndexedDb(IptvEpisodeMetadata.serializer(), item.value),
+            )
+        }
+        is DurableCatalogItem.M3uPlaylistEntry -> {
+            item.value.id.value.checkedIndexedDbIdentity()
+            item.value.name.checkedIndexedDbDisplayName()
+            item.value.logoUrl?.requireIndexedDbSafeReference()
+            IndexedDbEncodedCatalogItem(
+                item.value.id.value,
+                encodeIndexedDb(IptvPlaylistEntryMetadata.serializer(), item.value),
             )
         }
     }
@@ -574,6 +585,8 @@ private fun decodeIndexedDbCatalogItem(kind: DurableCatalogKind, payload: String
             DurableCatalogItem.IptvSeries(decodeIndexedDb(IptvSeriesMetadata.serializer(), payload))
         DurableCatalogKind.IptvEpisode ->
             DurableCatalogItem.IptvEpisode(decodeIndexedDb(IptvEpisodeMetadata.serializer(), payload))
+        DurableCatalogKind.M3uPlaylistEntry ->
+            DurableCatalogItem.M3uPlaylistEntry(decodeIndexedDb(IptvPlaylistEntryMetadata.serializer(), payload))
     }
 
 private fun <T> decodeIndexedDb(serializer: KSerializer<T>, payload: String): T {

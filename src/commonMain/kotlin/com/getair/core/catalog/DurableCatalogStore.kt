@@ -8,6 +8,7 @@ import com.getair.iptv.model.EpgProgramme
 import com.getair.iptv.model.IptvChannelMetadata
 import com.getair.iptv.model.IptvEpisodeMetadata
 import com.getair.iptv.model.IptvMovieMetadata
+import com.getair.iptv.model.IptvPlaylistEntryMetadata
 import com.getair.iptv.model.IptvSeriesMetadata
 import com.getair.stremio.model.MetaPreview
 import kotlinx.datetime.Instant
@@ -26,6 +27,7 @@ enum class DurableCatalogKind(internal val storageValue: String) {
     IptvMovie("iptv-movie"),
     IptvSeries("iptv-series"),
     IptvEpisode("iptv-episode"),
+    M3uPlaylistEntry("m3u-playlist-entry"),
 }
 
 data class DurableCatalogKey(
@@ -46,6 +48,7 @@ sealed interface DurableCatalogItem {
     data class IptvMovie(val value: IptvMovieMetadata) : DurableCatalogItem
     data class IptvSeries(val value: IptvSeriesMetadata) : DurableCatalogItem
     data class IptvEpisode(val value: IptvEpisodeMetadata) : DurableCatalogItem
+    data class M3uPlaylistEntry(val value: IptvPlaylistEntryMetadata) : DurableCatalogItem
 }
 
 data class DurableCatalogPageItem(

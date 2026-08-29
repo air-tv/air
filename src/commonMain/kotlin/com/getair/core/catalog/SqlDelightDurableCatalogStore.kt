@@ -11,6 +11,7 @@ import com.getair.iptv.model.EpgProgramme
 import com.getair.iptv.model.IptvChannelMetadata
 import com.getair.iptv.model.IptvEpisodeMetadata
 import com.getair.iptv.model.IptvMovieMetadata
+import com.getair.iptv.model.IptvPlaylistEntryMetadata
 import com.getair.iptv.model.IptvSeriesMetadata
 import com.getair.stremio.model.MetaPreview
 import kotlinx.coroutines.CancellationException
@@ -502,6 +503,7 @@ private fun requireItemMatches(kind: DurableCatalogKind, item: DurableCatalogIte
         DurableCatalogKind.IptvMovie -> item is DurableCatalogItem.IptvMovie
         DurableCatalogKind.IptvSeries -> item is DurableCatalogItem.IptvSeries
         DurableCatalogKind.IptvEpisode -> item is DurableCatalogItem.IptvEpisode
+        DurableCatalogKind.M3uPlaylistEntry -> item is DurableCatalogItem.M3uPlaylistEntry
     }
     require(matches) { "Catalog item kind does not match its catalog" }
 }
@@ -545,6 +547,14 @@ private fun encodeCatalogItem(item: DurableCatalogItem): EncodedCatalogItem = wh
             item.value.id.value.checkedIdentity(),
             item.value.title.checkedDisplayName(),
             encode(IptvEpisodeMetadata.serializer(), item.value),
+        )
+    }
+    is DurableCatalogItem.M3uPlaylistEntry -> {
+        validatePlaylistEntryMetadata(item.value)
+        EncodedCatalogItem(
+            item.value.id.value.checkedIdentity(),
+            item.value.name.checkedDisplayName(),
+            encode(IptvPlaylistEntryMetadata.serializer(), item.value),
         )
     }
 }
@@ -611,6 +621,12 @@ private fun validateEpisodeMetadata(value: IptvEpisodeMetadata) {
     value.title.checkedDisplayName()
 }
 
+private fun validatePlaylistEntryMetadata(value: IptvPlaylistEntryMetadata) {
+    value.id.value.checkedIdentity()
+    value.name.checkedDisplayName()
+    value.logoUrl?.requireSafeReference()
+}
+
 private fun String.checkedIdentity(): String {
     require(isNotBlank() && length <= 512 && '\u0000' !in this) { "Catalog identity is invalid" }
     return this
@@ -668,6 +684,8 @@ private fun decodeCatalogItem(kind: DurableCatalogKind, payload: String): Durabl
             DurableCatalogItem.IptvSeries(decode(IptvSeriesMetadata.serializer(), payload))
         DurableCatalogKind.IptvEpisode ->
             DurableCatalogItem.IptvEpisode(decode(IptvEpisodeMetadata.serializer(), payload))
+        DurableCatalogKind.M3uPlaylistEntry ->
+            DurableCatalogItem.M3uPlaylistEntry(decode(IptvPlaylistEntryMetadata.serializer(), payload))
     }
 
 private fun <T> decode(serializer: KSerializer<T>, payload: String): T {

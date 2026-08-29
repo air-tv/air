@@ -43,6 +43,27 @@ import kotlin.test.assertTrue
 @OptIn(ExperimentalCoroutinesApi::class)
 class SqlDelightDurableCatalogStoreTest {
     @Test
+    fun m3uMetadataRoundTripsWithoutPersistingPlaybackPayloads() = withDatabase { path ->
+        verifyDurableM3uCatalogContract { openStore(path) }
+
+        DriverManager.getConnection("jdbc:sqlite:${path.toAbsolutePath()}").use { connection ->
+            connection.createStatement().use { statement ->
+                statement.executeQuery(
+                    "SELECT payload FROM catalog_entry WHERE kind = 'm3u-playlist-entry'",
+                ).use { rows ->
+                    assertTrue(rows.next())
+                    val payload = rows.getString(1)
+                    assertFalse("must-not-persist" in payload)
+                    assertFalse("streamUrl" in payload)
+                    assertFalse("headers" in payload)
+                    assertFalse("attributes" in payload)
+                    assertFalse("\"source\"" in payload)
+                }
+            }
+        }
+    }
+
+    @Test
     fun activatesExactCountsAndPagesOnlyTheActiveGeneration() = withDatabase { path ->
         val store = openStore(path)
         val source = source("one")
@@ -282,7 +303,14 @@ class SqlDelightDurableCatalogStoreTest {
             // Only metadata variants exist. Their protocol contracts have no stream
             // URL, direct source, or request-header field.
             assertEquals(
-                setOf("Stremio", "IptvChannel", "IptvMovie", "IptvSeries", "IptvEpisode"),
+                setOf(
+                    "Stremio",
+                    "IptvChannel",
+                    "IptvMovie",
+                    "IptvSeries",
+                    "IptvEpisode",
+                    "M3uPlaylistEntry",
+                ),
                 DurableCatalogItem::class.java.declaredClasses.map { it.simpleName }.toSet(),
             )
             store.close()
@@ -501,6 +529,7 @@ class SqlDelightDurableCatalogStoreTest {
         is DurableCatalogItem.IptvMovie -> item.value.id.value
         is DurableCatalogItem.IptvSeries -> item.value.id.value
         is DurableCatalogItem.IptvEpisode -> item.value.id.value
+        is DurableCatalogItem.M3uPlaylistEntry -> item.value.id.value
     }
 
     private fun programme(

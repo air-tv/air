@@ -12,6 +12,13 @@ import kotlin.time.Duration.Companion.seconds
 
 class BrowserDurableCatalogStoreTest {
     @Test
+    fun m3uMetadataContractRunsInARealBrowser() = runTest(timeout = 30.seconds) {
+        if (!verifyIndexedDbIsAvailableOrFailsHonestly()) return@runTest
+        val databaseName = uniqueDatabase("m3u")
+        verifyDurableM3uCatalogContract { openBrowserDurableCatalogStore(databaseName) }
+    }
+
+    @Test
     fun indexedDbContractRunsInARealBrowser() = runTest(timeout = 30.seconds) {
         if (!verifyIndexedDbIsAvailableOrFailsHonestly()) return@runTest
         verifyIndexedDbCatalogContract(
