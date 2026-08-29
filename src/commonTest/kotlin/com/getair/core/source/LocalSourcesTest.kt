@@ -1,11 +1,21 @@
 package com.getair.core.source
 
 import com.getair.core.household.HouseholdProfileId
+import com.getair.core.persistence.InMemoryDocumentStore
+import com.getair.core.persistence.PersistentLocalSourceStore
 import com.getair.iptv.XtreamCredentials
 import com.getair.iptv.model.StreamFormat
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNull
@@ -127,6 +137,146 @@ class LocalSourcesTest {
     }
 
     @Test
+    fun vaultFailureKeepsDurableMetadataSoRemovalCanRetryAfterReopen() = runTest {
+        val documents = InMemoryDocumentStore()
+        val store = PersistentLocalSourceStore.open(documents)
+        val vault = ControllableSecretStore()
+        val source = LocalSourceProfile(LocalSourceId("living-tv"), "Living TV", LocalSourceKind.M3u)
+        val registry = LocalSourceRegistry(store, vault)
+        registry.upsert(source, M3uSourceSecret("https://provider.invalid/private.m3u"))
+        val revision = registry.state.value.revision
+        vault.removeFailure = IllegalStateException("vault failed with private.m3u")
+
+        assertIs<LocalSourceRemovalException.CredentialStore>(
+            assertFailsWith<LocalSourceRemovalException> { registry.remove(source.id) },
+        )
+
+        assertEquals(listOf(source), registry.state.value.profiles)
+        assertEquals(revision, registry.state.value.revision)
+        assertIs<M3uSourceSecret>(vault.read(source.id))
+
+        val reopenedStore = PersistentLocalSourceStore.open(documents)
+        LocalSourceRegistry(reopenedStore, vault).remove(source.id)
+
+        assertTrue(reopenedStore.state.value.profiles.isEmpty())
+        assertEquals(revision + 1, reopenedStore.state.value.revision)
+        assertNull(vault.read(source.id))
+    }
+
+    @Test
+    fun metadataFailureLeavesRetryHandleAfterCredentialIsGone() = runTest {
+        val store = ControllableSourceStore()
+        val vault = ControllableSecretStore()
+        val source = LocalSourceProfile(LocalSourceId("living-tv"), "Living TV", LocalSourceKind.M3u)
+        val registry = LocalSourceRegistry(store, vault)
+        registry.upsert(source, M3uSourceSecret("https://provider.invalid/private.m3u"))
+        val revision = registry.state.value.revision
+        store.replaceFailure = IllegalStateException("disk failed with private.m3u")
+
+        assertIs<LocalSourceRemovalException.MetadataStore>(
+            assertFailsWith<LocalSourceRemovalException> { registry.remove(source.id) },
+        )
+
+        assertEquals(listOf(source), registry.state.value.profiles)
+        assertEquals(revision, registry.state.value.revision)
+        assertNull(vault.read(source.id))
+
+        LocalSourceRegistry(store, vault).remove(source.id)
+
+        assertTrue(store.state.value.profiles.isEmpty())
+        assertEquals(revision + 1, store.state.value.revision)
+    }
+
+    @Test
+    fun cancelledPartialVaultRemovalRemainsRetryable() = runTest {
+        val store = ControllableSourceStore()
+        val vault = ControllableSecretStore()
+        val source = LocalSourceProfile(LocalSourceId("living-tv"), "Living TV", LocalSourceKind.M3u)
+        val registry = LocalSourceRegistry(store, vault)
+        registry.upsert(source, M3uSourceSecret("https://provider.invalid/private.m3u"))
+        val removedFromVault = CompletableDeferred<Unit>()
+        vault.afterRemove = {
+            removedFromVault.complete(Unit)
+            awaitCancellation()
+        }
+
+        val removal = async { registry.remove(source.id) }
+        removedFromVault.await()
+        removal.cancelAndJoin()
+
+        assertEquals(listOf(source), store.state.value.profiles)
+        assertNull(vault.read(source.id))
+        vault.afterRemove = null
+
+        LocalSourceRegistry(store, vault).remove(source.id)
+
+        assertTrue(store.state.value.profiles.isEmpty())
+    }
+
+    @Test
+    fun concurrentAndMissingRemovalAreSerializedIdempotentNoOps() = runTest {
+        val store = ControllableSourceStore()
+        val vault = ControllableSecretStore()
+        val source = LocalSourceProfile(LocalSourceId("living-tv"), "Living TV", LocalSourceKind.M3u)
+        val registry = LocalSourceRegistry(store, vault)
+        registry.upsert(source, M3uSourceSecret("https://provider.invalid/private.m3u"))
+        val removalStarted = CompletableDeferred<Unit>()
+        val allowRemoval = CompletableDeferred<Unit>()
+        vault.afterRemove = {
+            removalStarted.complete(Unit)
+            allowRemoval.await()
+        }
+
+        val first = async { registry.remove(source.id) }
+        removalStarted.await()
+        val concurrent = async { registry.remove(source.id) }
+        assertEquals(listOf(source), registry.state.value.profiles)
+        allowRemoval.complete(Unit)
+        first.await()
+        concurrent.await()
+        val revision = store.state.value.revision
+        val replaceCalls = store.replaceCalls
+        registry.remove(source.id)
+        registry.remove(LocalSourceId("missing"))
+
+        assertEquals(1, vault.removeCalls)
+        assertEquals(replaceCalls, store.replaceCalls)
+        assertEquals(revision, store.state.value.revision)
+        assertTrue(store.state.value.profiles.isEmpty())
+    }
+
+    @Test
+    fun removalFailuresDoNotRetainProviderDiagnostics() = runTest {
+        val secretText = "https://user:private-password@provider.invalid/list.m3u"
+        val source = LocalSourceProfile(LocalSourceId("private-source-id"), "Living TV", LocalSourceKind.M3u)
+
+        suspend fun failureFrom(
+            configure: (ControllableSourceStore, ControllableSecretStore) -> Unit,
+        ): LocalSourceRemovalException {
+            val store = ControllableSourceStore()
+            val vault = ControllableSecretStore()
+            val registry = LocalSourceRegistry(store, vault)
+            registry.upsert(source, M3uSourceSecret(secretText))
+            configure(store, vault)
+            return assertFailsWith<LocalSourceRemovalException> { registry.remove(source.id) }
+        }
+
+        val credentialFailure = failureFrom { _, vault ->
+            vault.removeFailure = IllegalStateException("credential failure: $secretText")
+        }
+        val metadataFailure = failureFrom { store, _ ->
+            store.replaceFailure = IllegalStateException("metadata failure: $secretText")
+        }
+
+        listOf(credentialFailure, metadataFailure).forEach { failure ->
+            assertFalse(secretText in failure.toString())
+            assertFalse("private-password" in failure.toString())
+            assertFalse("private-source-id" in failure.toString())
+            assertNull(failure.cause)
+        }
+    }
+
+    @Test
     fun sameEnabledStateAndMissingRemovalDoNotChurnRevision() = runTest {
         val registry = LocalSourceRegistry(InMemoryLocalSourceStore(), InMemoryLocalSourceSecretStore())
         val profile = LocalSourceProfile(LocalSourceId("addon"), "Metadata", LocalSourceKind.StremioAddon)
@@ -153,5 +303,48 @@ class LocalSourcesTest {
         registry.upsert(profile, secret())
 
         assertEquals(revision, registry.state.value.revision)
+    }
+}
+
+private class ControllableSourceStore(
+    initial: LocalSourceState = LocalSourceState(),
+) : LocalSourceStore {
+    private val mutableState = MutableStateFlow(initial)
+    override val state: StateFlow<LocalSourceState> = mutableState.asStateFlow()
+    var replaceFailure: Exception? = null
+    var replaceCalls: Int = 0
+        private set
+
+    override suspend fun replace(state: LocalSourceState) {
+        replaceCalls++
+        replaceFailure?.let { failure ->
+            replaceFailure = null
+            throw failure
+        }
+        mutableState.value = state
+    }
+}
+
+private class ControllableSecretStore : LocalSourceSecretStore {
+    private val values = mutableMapOf<LocalSourceId, LocalSourceSecret>()
+    var removeFailure: Exception? = null
+    var afterRemove: (suspend () -> Unit)? = null
+    var removeCalls: Int = 0
+        private set
+
+    override suspend fun read(id: LocalSourceId): LocalSourceSecret? = values[id]
+
+    override suspend fun write(id: LocalSourceId, secret: LocalSourceSecret) {
+        values[id] = secret
+    }
+
+    override suspend fun remove(id: LocalSourceId) {
+        removeCalls++
+        removeFailure?.let { failure ->
+            removeFailure = null
+            throw failure
+        }
+        values.remove(id)
+        afterRemove?.invoke()
     }
 }

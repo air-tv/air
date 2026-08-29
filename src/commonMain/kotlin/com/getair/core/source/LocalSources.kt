@@ -3,6 +3,7 @@ package com.getair.core.source
 import com.getair.core.household.HouseholdProfileId
 import com.getair.iptv.StalkerCredentials
 import com.getair.iptv.XtreamCredentials
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -170,6 +171,11 @@ sealed interface SourceRefreshResult {
     data class Updated(val revision: Long) : SourceRefreshResult
 }
 
+sealed class LocalSourceRemovalException(message: String) : IllegalStateException(message) {
+    class CredentialStore : LocalSourceRemovalException("Local source credentials could not be removed")
+    class MetadataStore : LocalSourceRemovalException("Local source metadata could not be removed")
+}
+
 class LocalSourceRegistry(
     private val store: LocalSourceStore,
     private val secrets: LocalSourceSecretStore,
@@ -243,16 +249,34 @@ class LocalSourceRegistry(
         secrets.read(id)
     }
 
+    /**
+     * Removes the credential before its durable metadata. The metadata is the
+     * retry handle: if either step fails or is cancelled, a later call (also
+     * after reopening the application state) can safely repeat both idempotent
+     * removals. A completed call never publishes metadata for a removed secret.
+     */
     suspend fun remove(id: LocalSourceId) = commands.withLock {
         val previous = state.value
         if (previous.profiles.none { it.id == id }) return@withLock
-        store.replace(
-            previous.copy(
-                profiles = previous.profiles.filterNot { it.id == id },
-                revision = previous.revision + 1,
-            ),
-        )
-        secrets.remove(id)
+        try {
+            secrets.remove(id)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            throw LocalSourceRemovalException.CredentialStore()
+        }
+        try {
+            store.replace(
+                previous.copy(
+                    profiles = previous.profiles.filterNot { it.id == id },
+                    revision = previous.revision + 1,
+                ),
+            )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            throw LocalSourceRemovalException.MetadataStore()
+        }
     }
 
     suspend fun refreshMetadata(): SourceRefreshResult = commands.withLock {
