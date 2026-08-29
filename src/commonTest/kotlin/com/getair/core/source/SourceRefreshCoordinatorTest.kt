@@ -2,10 +2,12 @@ package com.getair.core.source
 
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -119,6 +121,47 @@ class SourceRefreshCoordinatorTest {
         retainedGate.complete(Unit)
         runCurrent()
         assertEquals(SourceRefreshPhase.Succeeded, coordinator.stateOf(retained).phase)
+    }
+
+    @Test
+    fun removalWaitsForCancellationInsensitiveNativeCompletionBeforeCacheDeletion() = runTest {
+        val source = LocalSourceId("native-refresh")
+        val started = CompletableDeferred<Unit>()
+        val nativeCompletion = CompletableDeferred<Unit>()
+        val cache = mutableMapOf<LocalSourceId, String>()
+        val coordinator = SourceRefreshCoordinator(
+            scope = backgroundScope,
+            task = SourceRefreshTask { id ->
+                started.complete(Unit)
+                try {
+                    awaitCancellation()
+                } finally {
+                    withContext(NonCancellable) {
+                        nativeCompletion.await()
+                        cache[id] = "late-native-publish"
+                    }
+                }
+            },
+        )
+        coordinator.request(source)
+        runCurrent()
+        started.await()
+
+        val removal = launch { coordinator.remove(source) }
+        runCurrent()
+
+        assertTrue(removal.isActive)
+        assertNull(coordinator.states.value[source])
+        assertNull(cache[source])
+
+        nativeCompletion.complete(Unit)
+        removal.join()
+        cache.remove(source)
+        runCurrent()
+
+        assertFalse(removal.isActive)
+        assertNull(coordinator.states.value[source])
+        assertNull(cache[source])
     }
 
     @Test

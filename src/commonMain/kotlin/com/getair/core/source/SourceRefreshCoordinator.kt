@@ -159,7 +159,9 @@ class SourceRefreshCoordinator(
             launchAvailableLocked()
             entry.activeJob
         }
-        job?.cancel(CancellationException("Removed source refresh cancelled"))
+        withContext(NonCancellable) {
+            job?.cancelAndJoin()
+        }
     }
 
     /** Stops coordinator-owned work without cancelling the caller's scope. */
