@@ -13,6 +13,9 @@ import com.getair.core.library.ProfileLibrarySyncSource
 import com.getair.core.source.LocalSourceRegistry
 import com.getair.core.source.LocalSourceSecretStore
 import com.getair.core.source.SourceMetadataSyncSource
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /** Optional future-server seams; ordinary local construction uses [None]. */
 class LocalApplicationSyncSources(
@@ -33,16 +36,40 @@ class LocalApplicationState internal constructor(
     val continueWatching: LocalFirstContinueWatchingRepository,
     val profileLibrary: LocalFirstProfileLibraryRepository,
 ) {
+    private val profileCommands = Mutex()
+
     /**
-     * Removes a profile and its source assignments. Removing the household
-     * record first keeps a failed follow-up cleanup from exposing a source to
-     * another profile; retrying this command completes the idempotent cleanup.
-     */
-    suspend fun removeProfile(id: HouseholdProfileId) {
-        household.removeProfile(id)
-        sources.removeProfileAccess(id)
-        continueWatching.clear(id)
-        profileLibrary.removeProfile(id)
+     * Removes profile-owned state before removing the household record. The
+     * record remains a durable retry handle until every idempotent cleanup has
+     * completed, including across application restarts. Source pruning only
+     * removes this profile from an existing restricted scope and never widens
+     * that scope to global access.
+    */
+    suspend fun removeProfile(id: HouseholdProfileId) = profileCommands.withLock {
+        removalStep({ LocalProfileRemovalException.SourceAccessRemoval() }) { sources.removeProfileAccess(id) }
+        removalStep({ LocalProfileRemovalException.ContinueWatchingRemoval() }) { continueWatching.clear(id) }
+        removalStep({ LocalProfileRemovalException.ProfileLibraryRemoval() }) { profileLibrary.removeProfile(id) }
+        removalStep({ LocalProfileRemovalException.HouseholdRecordRemoval() }) { household.removeProfile(id) }
+    }
+}
+
+sealed class LocalProfileRemovalException(message: String) : IllegalStateException(message) {
+    class SourceAccessRemoval : LocalProfileRemovalException("Profile source access could not be removed")
+    class ContinueWatchingRemoval : LocalProfileRemovalException("Profile watch history could not be removed")
+    class ProfileLibraryRemoval : LocalProfileRemovalException("Profile library could not be removed")
+    class HouseholdRecordRemoval : LocalProfileRemovalException("Household profile could not be removed")
+}
+
+private suspend fun removalStep(
+    failure: () -> LocalProfileRemovalException,
+    action: suspend () -> Unit,
+) {
+    try {
+        action()
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Exception) {
+        throw failure()
     }
 }
 
