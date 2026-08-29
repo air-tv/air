@@ -1,6 +1,6 @@
 # ADR-0002: Production application shells and canonical Compose UI ownership
 
-- Status: Proposed for implementation; no production repository has been created
+- Status: Accepted; Android-first production slice implemented
 - Date: 2026-08-28
 - Owners: Air application and platform shells
 
@@ -34,11 +34,11 @@ The current repositories establish these facts:
   AVFoundation, browser HTML video, and JVM backends live behind it. The
   optional `mediamp-air` JVM artifact supplies the movable Compose MPV surface
   for desktop without exposing mediamp types to the application.
-- At this audit snapshot, direct IndexedDB catalog storage is concurrently in
-  progress but is not yet merged and verified. Browser source secrets are
-  intentionally session-only. A JVM macOS Keychain-backed source-secret factory
-  is also absent; the existing Apple Keychain implementation is Kotlin/Native
-  and cannot be reused by a JVM desktop process.
+- Direct IndexedDB catalog storage is implemented and verified for the JS and
+  Wasm browser targets. Browser source secrets remain intentionally session-only.
+  A JVM macOS Keychain-backed source-secret factory is still absent; the existing
+  Apple Keychain implementation is Kotlin/Native and cannot be reused by a JVM
+  desktop process.
 - Local development currently uses sibling Gradle composite builds. IPTV,
   Stremio, Vizio, and video have GitHub Packages release workflows; `air` does
   not yet publish a KMP artifact. The mediamp Air package workflow exists but
@@ -63,8 +63,8 @@ full target matrix before changing the workspace compiler baseline.
 
 ## Decision
 
-Create one production application repository, provisionally `air-tv/app`,
-only when implementation begins. Keep the minimum justified structure:
+The production application repository is `air-tv/app`. Keep the minimum
+justified structure:
 
 ```text
 app/
@@ -93,11 +93,28 @@ scaffolds.
 | `stremio-addon-client` | addon discovery/resources/limits and exact Stremio models | addon assignment policy, UI |
 | `video` | backend-neutral playback contract and platform engines | application chrome, routes, source selection |
 | `mediamp` | optional bundled desktop MPV implementation and Compose surface | Air presentation or application state |
-| proposed `app` | canonical presentation models, production UI source, composition root, platform entry points, packaging | protocol reimplementation, generic framework layers |
+| `app` | canonical presentation models, production UI source, composition root, platform entry points, packaging | protocol reimplementation, generic framework layers |
 | `design` | static fixtures, visual scenarios, screenshot/focus/performance harness | production state, transports, persistence, release application |
 
 No production module may depend on `design`. `design` will instead depend on
 the canonical TV UI owned by `app:shared`.
+
+### Implementation checkpoint (2026-08-28)
+
+- `air-tv/app` now contains the runnable `shared` and `androidApp` modules.
+- `app:shared` owns the only copy of the Android TV presentation models, routes,
+  theme, focus helpers, components, screens, player chrome, fonts, and colors.
+- `design` consumes that module through composite substitution and retains only
+  deterministic fixtures, its local Media3 test adapter, and the generated test
+  asset. It no longer owns or copies production screens.
+- The Android production shell opens Air local state and the durable catalog,
+  installs one removable verified Cinemeta metadata source on first run through
+  the source registry/Android Keystore, renders cached catalogs before refresh,
+  and atomically refreshes bounded movie/series pages through the real Stremio
+  client. IPTV remains empty until a user source is configured.
+- Desktop, web, iOS, production source-onboarding UI, artwork loading, and
+  production playback resolution remain later executable slices; this Android
+  checkpoint is not evidence for those targets.
 
 ### Extract the exact design UI once
 
